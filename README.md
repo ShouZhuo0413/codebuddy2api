@@ -162,11 +162,14 @@ python3 converter.py --log /tmp/cb.log            # 记到指定路径
 python3 converter.py                              # 不记日志
 ```
 
-每条日志记录：模型、是否流式、消息数、最后一条用户提问、耗时、finish_reason、工具调用、token 数、响应内容预览；若后端内容审核拦截会标 `⚠️内容审核拦截`。示例：
+每条日志记录：模型、是否流式、消息数、最后一条用户提问、耗时、finish_reason、工具调用、token 数；若后端内容审核拦截会标 `⚠️内容审核拦截`。**每次请求都用唯一 ID 串起来，并完整落盘**：发往后端的完整请求体（REQUEST BODY）、后端返回的完整内容（非流式是聚合后的 RESPONSE BODY，流式是后端原始的 RESPONSE RAW SSE）。排查"内容审核拦截""返回异常"等问题时，直接看日志里对应 ID 的完整报文即可。示例：
 ```
-[2026-06-19 11:52:01] → glm-5.2 | stream=False | msgs=1 | last_user='Reply with: ok'
-[2026-06-19 11:52:04] ← glm-5.2 | 3.6s | finish=stop | tokens=12
-[2026-06-19 11:52:04]    resp预览: 'ok'
+[2026-06-19 11:56:32] [9cc4488e] ▶ REQUEST glm-5.2 | stream=False | msgs=1 | last_user='Reply: pong'
+[2026-06-19 11:56:32] [9cc4488e] ── REQUEST BODY ──
+{ "model": "glm-5.2", "messages": [{"role":"user","content":"Reply: pong"}] }
+[2026-06-19 11:56:35] [9cc4488e] ◀ RESPONSE glm-5.2 | 3.0s | finish=stop | tokens=11
+[2026-06-19 11:56:35] [9cc4488e] ── RESPONSE BODY ──
+{ "choices":[{"message":{"content":"pong"},...}], "usage":{...} }
 ```
 
 ### ❓ 常见问题

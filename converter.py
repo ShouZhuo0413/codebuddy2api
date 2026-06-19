@@ -303,9 +303,12 @@ async def chat_completions(request: Request,
     tool_names = [t.get("function", {}).get("name") for t in (payload.get("tools") or [])
                   if isinstance(t, dict)]
     last_user = _last_user_text(messages)
-    _log(f"→ {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
+    rid = os.urandom(4).hex()
+    _log(f"[{rid}] ▶ REQUEST {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
          + (f" | tools={tool_names}" if tool_names else "")
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
+    # 完整请求体（发往后端的原样内容）
+    _log(f"[{rid}] ── REQUEST BODY ──\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
 
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
@@ -313,7 +316,7 @@ async def chat_completions(request: Request,
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_upstream(url, headers, body, model_name, t0),
+            _stream_upstream(url, headers, body, model_name, t0, rid),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -324,15 +327,16 @@ async def chat_completions(request: Request,
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
-                    _log(f"✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),120)}")
+                    _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
+                    _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
                     raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
                 collected = await _collect_stream(r)
     except HTTPException:
         raise
     except httpx.HTTPError as e:
-        _log(f"✗ 网络错误 | {model_name} | {e}")
+        _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
         raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
-    _log_finish(model_name, t0, collected)
+    _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
 
 
@@ -351,9 +355,10 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
-def _log_finish(model_name: str, t0: float, result: dict):
-    """记录一次完成的请求：耗时 / finish_reason / usage / 工具调用 / 审核拦截。"""
+def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
+    """记录一次完成的请求：耗时 / finish_reason / usage / 工具调用 / 审核拦截 + 完整响应。"""
     elapsed = time.time() - t0
+    prefix = f"[{rid}] " if rid else ""
     choice = (result.get("choices") or [{}])[0]
     finish = choice.get("finish_reason")
     msg = choice.get("message") or {}
@@ -363,12 +368,11 @@ def _log_finish(model_name: str, t0: float, result: dict):
     if finish == "content-filter":
         tag = " ⚠️内容审核拦截"
     tc_names = [t.get("function", {}).get("name") for t in tcs]
-    _log(f"← {model_name} | {elapsed:.1f}s | finish={finish}{tag}"
+    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | finish={finish}{tag}"
          + (f" | tool_calls={tc_names}" if tc_names else "")
          + f" | tokens={usage.get('total_tokens', '?')}")
-    # 响应内容预览（短）
-    if finish != "tool_calls" and msg.get("content"):
-        _log(f"   resp预览: {_truncate(msg.get('content'), 120)!r}")
+    # 完整响应体
+    _log(f"{prefix}── RESPONSE BODY ──\n{json.dumps(result, ensure_ascii=False, indent=2)}")
 
 
 async def _collect_stream(response: httpx.Response) -> dict:
@@ -445,16 +449,19 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
 
 
 async def _stream_upstream(url: str, headers: dict, body: dict,
-                           model_name: str = "?", t0: float = 0.0):
+                           model_name: str = "?", t0: float = 0.0, rid: str = ""):
     """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
 
     同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
+    完整原始 SSE 累积后落盘到日志（调试用）。
     """
     finish_reason = None
     tool_names: list[str] = []
     usage: dict = {}
     saw_filter = False
     buf = b""
+    raw_parts: list[bytes] = []   # 累积完整原始 SSE
+    prefix = f"[{rid}] " if rid else ""
 
     def _feed(chunk: bytes):
         nonlocal finish_reason, saw_filter, buf
@@ -494,23 +501,27 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
-                    _log(f"✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),120)}")
+                    _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
+                    _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8','replace')}")
                     yield _err_event(err, r.status_code)
                     return
                 async for chunk in r.aiter_bytes():
                     if chunk:
+                        raw_parts.append(chunk)
                         _feed(chunk)
                         yield chunk
     except httpx.HTTPError as e:
-        _log(f"✗ 网络错误 | {model_name} | {e}")
+        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
 
     # 流结束：输出完成日志
     elapsed = time.time() - t0 if t0 else 0
     tag = " ⚠️内容审核拦截" if (saw_filter or finish_reason == "content-filter") else ""
-    _log(f"← {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
+    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
          + (f" | tool_calls={tool_names}" if tool_names else "")
          + f" | tokens={usage.get('total_tokens', '?')}")
+    # 完整原始 SSE（后端返回的全部内容）
+    _log(f"{prefix}── RESPONSE RAW SSE ──\n{b''.join(raw_parts).decode('utf-8','replace')}")
 
 
 def _safe_err(r: httpx.Response) -> dict:
