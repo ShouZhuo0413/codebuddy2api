@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  codebuddy2openai:
+    build: .
+    container_name: codebuddy2openai
+    ports:
+      - "8787:8787"
+    volumes:
+      # 挂载宿主机的 CodeBuddy 登录凭据（macOS 示例，请按你的系统修改路径）
+      - ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro
+    environment:
+      # 如需鉴权，设置 API Key（客户端请求时需携带相同的 key）
+      - CODEBUDDY2OPENAI_KEY=
+      # 指定 auth 文件挂载路径（转换器会自动读取）
+      - CODEBUDDY_AUTH_DIR=/data/auth
+    command: >
+      python3 converter.py
+      --host 0.0.0.0
+      --port 8787
+      --skip-check
+      --desensitize
+    restart: unless-stopped

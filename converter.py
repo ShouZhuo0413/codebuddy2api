@@ -61,6 +61,9 @@ USER_AGENT = "codebuddy2openai/2.0"
 # ---------------------------------------------------------------------------
 
 def auth_dirs() -> list[Path]:
+    env_dir = os.environ.get("CODEBUDDY_AUTH_DIR")
+    if env_dir:
+        return [Path(env_dir)]
     home = Path.home()
     plat = sys.platform
     if plat == "darwin":

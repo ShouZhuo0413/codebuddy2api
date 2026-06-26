@@ -77,6 +77,47 @@ python3 converter.py
 
 启动时会做一次预检，打印账号信息和 token 状态。
 
+### 🐳 Docker 部署
+
+如果你更习惯用 Docker 运行，项目已内置 `Dockerfile` 和 `docker-compose.yml`。
+
+> **注意**：Docker 容器内无法访问宿主机的 CodeBuddy 桌面端登录凭据，需要把宿主机的 auth 文件挂载进容器。
+
+**1. 使用 docker compose（推荐）**
+
+```bash
+# 编辑 docker-compose.yml 中的 volumes 路径，改为你的系统对应的 auth 目录：
+#   macOS:   ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth
+#   Windows: %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth
+#   Linux:   ~/.local/share/CodeBuddyExtension/Data/Public/auth
+
+docker compose up -d --build
+```
+
+**2. 使用 docker 命令**
+
+```bash
+# 构建镜像
+docker build -t codebuddy2openai .
+
+# 运行容器（macOS 示例，按你的系统修改挂载路径）
+docker run -d --name codebuddy2openai -p 8787:8787 
+  -v ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro 
+  -e CODEBUDDY_AUTH_DIR=/data/auth 
+  codebuddy2openai
+```
+
+**3. 环境变量说明**
+
+| 变量 | 说明 |
+|------|------|
+| `CODEBUDDY_AUTH_DIR` | 指定 auth 凭据目录（容器内挂载路径） |
+| `CODEBUDDY2OPENAI_KEY` | 设置 API Key 鉴权（留空则不鉴权） |
+| `CODEBUDDY2OPENAI_LOG` | 日志文件路径 |
+
+启动后同样访问 `http://127.0.0.1:8787/v1` 即可。
+
+
 ### 🛠️ Function Calling（工具调用）
 
 后端原生支持标准 OpenAI function calling。客户端（如 ZCode / Cherry Studio）在请求里带 `tools`，模型原生返回 `tool_calls`（`finish_reason:"tool_calls"`），客户端执行工具后把 `role:"tool"` 的结果回传即可——和直连 OpenAI 完全一致。流式、非流式、多轮工具调用都支持。
@@ -235,14 +276,63 @@ A minimal local **protocol converter / proxy** that exposes your already-logged-
 ### 🚀 Quick Start
 
 ```bash
-git clone https://github.com/HanHan666666/codebuddy2openai.git
+git clone https://github.com/ShouZhuo0413/codebuddy2openai
 cd codebuddy2openai
 pip install fastapi "uvicorn[standard]" httpx
-python3 converter.py
+
+# 或使用虚拟环境
+python3 -m venv .venv
+source .venv/bin/activate
+pip install fastapi "uvicorn[standard]" httpx
+
+# 开启敏感词过滤并打印日志
+python3 converter.py --desensitize --log converter.log
+
 # Look for "✅ 监听 http://127.0.0.1:8787" — that means it's running.
 ```
 
 Then point your client at `http://127.0.0.1:8787/v1`. For **Codex CLI**, add `wire_api = "responses"` to your config (see `codex-codebuddy.example.toml`). For other OpenAI-compatible clients, just set the API base URL.
+
+### 🐳 Docker Deployment
+
+The project ships with a `Dockerfile` and `docker-compose.yml`.
+
+> **Note**: The Docker container cannot access the host's CodeBuddy desktop credentials, so you need to mount the auth directory into the container.
+
+**1. Using docker compose (recommended)**
+
+```bash
+# Edit the volumes path in docker-compose.yml to match your OS auth directory:
+#   macOS:   ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth
+#   Windows: %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth
+#   Linux:   ~/.local/share/CodeBuddyExtension/Data/Public/auth
+
+docker compose up -d --build
+```
+
+**2. Using docker command**
+
+```bash
+# Build image
+docker build -t codebuddy2openai .
+
+# Run container (macOS example — adjust the mount path for your OS)
+docker run -d --name codebuddy2openai -p 8787:8787 
+  -v ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro 
+  -e CODEBUDDY_AUTH_DIR=/data/auth 
+  codebuddy2openai
+```
+
+**3. Environment Variables**
+
+| Variable | Description |
+|----------|-------------|
+| `CODEBUDDY_AUTH_DIR` | Auth credentials directory (mount path inside container) |
+| `CODEBUDDY2OPENAI_KEY` | API Key for authentication (empty = no auth) |
+| `CODEBUDDY2OPENAI_LOG` | Log file path |
+
+Access `http://127.0.0.1:8787/v1` after startup.
+
 
 ### 🛠️ Function Calling
 
