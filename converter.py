@@ -47,6 +47,7 @@ from responses_adapter import (
     responses_request_to_chat,
     ResponsesStreamConverter,
 )
+from responses_projection import project_responses_chat_body
 from anthropic_adapter import (
     anthropic_request_to_chat,
     AnthropicStreamConverter,
@@ -570,6 +571,56 @@ def _err_event(msg: bytes, status: int) -> bytes:
     return f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+def _looks_like_content_filter_text(text: str) -> bool:
+    text = (text or "").lower()
+    return (
+        "content-filter" in text
+        or "content_filter" in text
+        or "敏感内容" in text
+        or "内容审核" in text
+        or "无法响应您的请求" in text
+    )
+
+
+def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
+    if not CONFIG.get("desensitize"):
+        return body
+    return desensitize_body(
+        body,
+        roles=("system", "developer"),
+        desensitize_harness_user=True,
+        desensitize_tools=True,
+        compact_harness=(force_compact or not CONFIG.get("no_compact")),
+        strip_tool_metadata=True,
+    )
+
+
+async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, bytes]:
+    async with httpx.AsyncClient(timeout=120) as c:
+        async with c.stream("POST", url, headers=headers, json=body) as r:
+            chunks: list[bytes] = []
+            async for chunk in r.aiter_bytes():
+                if chunk:
+                    chunks.append(chunk)
+            return r.status_code, b"".join(chunks)
+
+
+async def _post_backend_with_filter_retry(url: str, headers: dict, body: dict,
+                                          rid: str = "", model_name: str = "?") -> tuple[int, bytes, dict]:
+    prefix = f"[{rid}] " if rid else ""
+    status, raw = await _post_backend_once(url, headers, body)
+    text = raw.decode("utf-8", "replace")
+    if status == 200 and _looks_like_content_filter_text(text) and CONFIG.get("desensitize") and CONFIG.get("no_compact"):
+        retry_body = _chat_body_desensitize(body, force_compact=True)
+        _log(f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness")
+        _log(f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}")
+        retry_status, retry_raw = await _post_backend_once(url, headers, retry_body)
+        retry_text = retry_raw.decode("utf-8", "replace")
+        if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
+            return retry_status, retry_raw, retry_body
+    return status, raw, body
+
+
 # ---------------------------------------------------------------------------
 # Responses API 端点（Codex CLI 兼容）
 # ---------------------------------------------------------------------------
@@ -598,22 +649,29 @@ async def create_response(request: Request,
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
+    chat_body, projection_stats = project_responses_chat_body(chat_body)
     chat_body.setdefault("model", "auto")
     chat_body["stream"] = True
     if "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
-    if CONFIG.get("desensitize"):
-        chat_body = desensitize_body(chat_body, roles=("system", "developer"),
-                                     desensitize_harness_user=True,
-                                     desensitize_tools=True,
-                                     compact_harness=not CONFIG.get("no_compact"),
-                                     strip_tool_metadata=True)
+    chat_body = _chat_body_desensitize(chat_body)
 
     client_wants_stream = payload.get("stream", True)  # Codex CLI 默认 stream
     model_name = payload.get("model", "auto")
     rid = os.urandom(4).hex()
     _log(f"[{rid}] ▶ RESPONSES {model_name} | stream={client_wants_stream} | input_items={len(payload.get('input', []))}")
+    _log(
+        f"[{rid}] ── RESPONSES PROJECTION ── "
+        f"mode={projection_stats.get('mode')} "
+        f"| msgs {projection_stats.get('original_messages')}→{projection_stats.get('projected_messages')} "
+        f"| chars {projection_stats.get('original_message_chars')}→{projection_stats.get('projected_message_chars')} "
+        f"| tools {projection_stats.get('original_tools')}→{projection_stats.get('projected_tools')} "
+        f"| tool_chars {projection_stats.get('original_tool_chars')}→{projection_stats.get('projected_tool_chars')} "
+        f"| summarized_history={projection_stats.get('summarized_history_messages', 0)} "
+        f"| dropped_harness={projection_stats.get('dropped_harness_messages', 0)} "
+        f"| anchor_user={projection_stats.get('anchor_user_preserved', False)}"
+    )
     _log(f"[{rid}] ── RESPONSES → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}")
 
     headers = cred.get_headers()
@@ -629,15 +687,14 @@ async def create_response(request: Request,
 
     # 非流式：聚合后端 SSE → 非流式 Response 对象
     try:
-        async with httpx.AsyncClient(timeout=300) as c:
-            async with c.stream("POST", url, headers=headers, json=chat_body) as r:
-                if r.status_code != 200:
-                    raw = await r.aread()
-                    _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
-                    raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
-                converter = ResponsesStreamConverter(model=model_name)
-                async for line in r.aiter_lines():
-                    converter.feed_line(line)
+        status_code, raw, final_body = await _post_backend_with_filter_retry(url, headers, chat_body, rid, model_name)
+        if status_code != 200:
+            _log(f"[{rid}] ✗ HTTP {status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
+            raise HTTPException(status_code=status_code, detail=_safe_err_raw(raw, status_code))
+        converter = ResponsesStreamConverter(model=model_name)
+        for line in raw.decode("utf-8", "replace").splitlines():
+            converter.feed_line(line)
+        chat_body = final_body
     except HTTPException:
         raise
     except httpx.HTTPError as e:
@@ -658,21 +715,19 @@ async def _stream_responses(url: str, headers: dict, body: dict,
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
-                    error_evt = {"type": "error", "error": {"message": err.decode('utf-8','replace')[:500], "code": r.status_code}}
-                    yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
-                    return
-                raw_sse_lines = []  # 记录原始 SSE 用于日志
-                async for line in r.aiter_lines():
-                    if line.strip():
-                        raw_sse_lines.append(line)
-                    events = converter.feed_line(line)
-                    if events:
-                        yield events.encode("utf-8")
+        status_code, raw, _ = await _post_backend_with_filter_retry(url, headers, body, rid, model_name)
+        if status_code != 200:
+            _log(f"{prefix}✗ HTTP {status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
+            error_evt = {"type": "error", "error": {"message": raw.decode('utf-8','replace')[:500], "code": status_code}}
+            yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
+            return
+        raw_sse_lines = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            if line.strip():
+                raw_sse_lines.append(line)
+            events = converter.feed_line(line)
+            if events:
+                yield events.encode("utf-8")
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         error_evt = {"type": "error", "error": {"message": str(e)[:500], "code": 502}}

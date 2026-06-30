@@ -14,6 +14,7 @@ from responses_adapter import (
     ResponsesStreamConverter,
 )
 from desensitize import desensitize_body
+from responses_projection import project_responses_chat_body
 
 
 def test_simple_text_request():
@@ -117,7 +118,7 @@ def test_typed_developer_message_request():
 
 
 def test_desensitize_harness_user_and_tools():
-    """测试：仅脱敏 harness user 上下文与 tool 描述，不改真实 user。"""
+    """测试：harness user 上下文会被摘要，tool 描述会脱敏，真实 user 不改。"""
     body = {
         "messages": [
             {"role": "system", "content": "Refuse exploit development."},
@@ -135,7 +136,7 @@ def test_desensitize_harness_user_and_tools():
         desensitize_tools=True,
     )
     assert "​" in out["messages"][0]["content"]
-    assert "​" in out["messages"][1]["content"]
+    assert "Repository instructions and durable user context are provided." in out["messages"][1]["content"]
     assert "​" not in out["messages"][2]["content"]
     assert "​" in out["tools"][0]["function"]["description"]
     print("✅ test_desensitize_harness_user_and_tools")
@@ -168,6 +169,224 @@ def test_compact_harness_messages_and_strip_tool_metadata():
     assert "description" not in out["tools"][0]["function"]
     assert "description" not in out["tools"][0]["function"]["parameters"]["properties"]["cmd"]
     print("✅ test_compact_harness_messages_and_strip_tool_metadata")
+
+
+def test_no_compact_still_prunes_codex_runtime_metadata():
+    """测试：保留全文模式仍会裁掉 Codex 注入的运行时元数据大段文本。"""
+    body = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a coding agent running in the Codex CLI.\n\n"
+                    "# How you work\nUse sandbox and escalation carefully.\n\n"
+                    "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written.\n"
+                    "## How to request escalation\n...\n</permissions instructions>\n\n"
+                    "The following deferred tools are now available via ToolSearch.\n..."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "# AGENTS.md instructions\n<INSTRUCTIONS>\nproject guidance\n</INSTRUCTIONS>"
+                    "<environment_context>\nvery long runtime context\n</environment_context>\n"
+                    "<skills_instructions>\nvery long skills metadata\n</skills_instructions>\n"
+                    "test"
+                ),
+            },
+            {"role": "user", "content": "test"},
+        ],
+    }
+    out = desensitize_body(
+        body,
+        roles=("system", "developer"),
+        desensitize_harness_user=True,
+        compact_harness=False,
+    )
+    system_text = out["messages"][0]["content"]
+    harness_text = out["messages"][1]["content"]
+    assert "You are a coding agent running in the Codex CLI" in system_text
+    assert "## Planning" not in system_text
+    assert "## Task execution" not in system_text
+    assert "### Final answer structure and style guidelines" not in system_text
+    assert "# How you work" in system_text
+    assert "Filesystem sandboxing defines" not in system_text
+    assert "ToolSearch" not in system_text
+    assert "Runtime permissions apply" in system_text
+    assert "Runtime tool, agent, sk" in system_text
+    assert "very long runtime context" not in harness_text
+    assert "very long skills metadata" not in harness_text
+    assert "# AGENTS.md instructions" not in harness_text
+    assert "Repository instructions and durable user context are provided." in harness_text
+    assert out["messages"][2]["content"] == "test"
+    print("✅ test_no_compact_still_prunes_codex_runtime_metadata")
+
+
+def test_responses_projection_compacts_codex_harness_and_tools():
+    """测试：Codex 风格请求会在首发阶段直接投影为短 system + 极简 schema。"""
+    body = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a coding agent running in the Codex CLI.\n"
+                    "# AGENTS.md spec\nVery long harness instructions."
+                ),
+            },
+            {
+                "role": "system",
+                "content": "Additional repo rule: always run tests after editing.",
+            },
+            {
+                "role": "user",
+                "content": "# AGENTS.md instructions\n<environment_context>\nlong context\n</environment_context>",
+            },
+            {"role": "user", "content": "实现该方案"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "description": "Run a command with a long dangerous description",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string", "description": "Shell command to execute."},
+                            "yield_time_ms": {"type": "number", "description": "Wait time"},
+                        },
+                        "required": ["cmd"],
+                        "additionalProperties": False,
+                    },
+                    "strict": False,
+                },
+            }
+        ],
+    }
+    out, stats = project_responses_chat_body(body)
+    assert stats["mode"] == "aggressive"
+    assert out["messages"][0]["role"] == "system"
+    assert "OpenAI-compatible CLI" in out["messages"][0]["content"]
+    assert all("# AGENTS.md instructions" not in msg.get("content", "") for msg in out["messages"])
+    assert any("Additional repo rule" in msg.get("content", "") for msg in out["messages"])
+    assert out["messages"][-1] == {"role": "user", "content": "实现该方案"}
+    tool = out["tools"][0]["function"]
+    assert tool["name"] == "exec_command"
+    assert "description" not in tool
+    assert "description" not in tool["parameters"]["properties"]["cmd"]
+    assert stats["projected_tool_chars"] < stats["original_tool_chars"]
+    print("✅ test_responses_projection_compacts_codex_harness_and_tools")
+
+
+def test_responses_projection_preserves_recent_tool_chain_and_summarizes_history():
+    """测试：较早轮次会被摘要，最近 tool 链保持完整。"""
+    big_output = "Chunk ID: a1\nWall time: 0.0\nProcess exited with code 0\nOutput:\n" + "\n".join(
+        f"line {i}" for i in range(40)
+    )
+    body = {
+        "messages": [
+            {"role": "system", "content": "You are a coding agent running in the Codex CLI."},
+            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context>ctx</environment_context>"},
+            {"role": "user", "content": "先看 README"},
+            {
+                "role": "assistant",
+                "content": "I will inspect the repository.",
+                "tool_calls": [
+                    {
+                        "id": "call_old",
+                        "type": "function",
+                        "function": {"name": "exec_command", "arguments": "{\"cmd\":\"ls -la\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_old", "content": "Output:\nREADME.md\nsrc\n"},
+            {"role": "assistant", "content": "README is present."},
+            {"role": "user", "content": "现在修复 converter 的 responses 链路"},
+            {
+                "role": "assistant",
+                "content": "I will patch the proxy and then run tests.",
+                "tool_calls": [
+                    {
+                        "id": "call_recent",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": json.dumps({"cmd": "sed -n '1,200p' converter.py", "yield_time_ms": 1000}),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_recent", "content": big_output},
+            {"role": "assistant", "content": "I found the endpoint and will implement projection now."},
+            {"role": "user", "content": "继续，别依赖 fallback retry"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                            "yield_time_ms": {"type": "number"},
+                        },
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    }
+    out, stats = project_responses_chat_body(body)
+    system_messages = [m["content"] for m in out["messages"] if m["role"] == "system"]
+    assert system_messages[0].startswith("You are a coding assistant serving an OpenAI-compatible CLI.")
+    assert any("Earlier conversation summary" in text for text in system_messages)
+    assert any("先看 README" in text for text in system_messages)
+
+    recent_assistant = next(
+        msg for msg in out["messages"]
+        if msg.get("role") == "assistant" and any(tc.get("id") == "call_recent" for tc in msg.get("tool_calls", []))
+    )
+    recent_tool = next(msg for msg in out["messages"] if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_recent")
+    assert recent_assistant["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert "Process exited with code 0" in recent_tool["content"]
+    assert "line 39" in recent_tool["content"]
+    assert len(recent_tool["content"]) < len(big_output)
+    assert out["messages"][-1] == {"role": "user", "content": "继续，别依赖 fallback retry"}
+    assert stats["summarized_history_messages"] >= 1
+    print("✅ test_responses_projection_preserves_recent_tool_chain_and_summarizes_history")
+
+
+def test_responses_projection_shrinks_large_tool_arguments():
+    """测试：超长 tool arguments 会压缩成结构化 JSON 摘要。"""
+    long_cmd = "echo " + ("x" * 1600)
+    body = {
+        "messages": [
+            {"role": "system", "content": "You are a coding agent running in the Codex CLI."},
+            {"role": "user", "content": "执行一个很长的命令"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_long",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": json.dumps({"cmd": long_cmd, "yield_time_ms": 1000, "workdir": "/tmp"}),
+                        },
+                    }
+                ],
+            },
+        ],
+        "tools": [],
+    }
+    out, _ = project_responses_chat_body(body)
+    args = out["messages"][-1]["tool_calls"][0]["function"]["arguments"]
+    parsed = json.loads(args)
+    assert parsed["cmd"].startswith("echo ")
+    assert "truncated" in parsed["cmd"]
+    print("✅ test_responses_projection_shrinks_large_tool_arguments")
 
 
 def test_stream_converter_text():
@@ -287,7 +506,11 @@ if __name__ == "__main__":
     test_typed_developer_message_request()
     test_desensitize_harness_user_and_tools()
     test_compact_harness_messages_and_strip_tool_metadata()
+    test_no_compact_still_prunes_codex_runtime_metadata()
+    test_responses_projection_compacts_codex_harness_and_tools()
+    test_responses_projection_preserves_recent_tool_chain_and_summarizes_history()
+    test_responses_projection_shrinks_large_tool_arguments()
     test_stream_converter_text()
     test_stream_converter_function_call()
     test_nonstream_response()
-    print(f"\n🎉 All {11} tests passed!")
+    print(f"\n🎉 All {15} tests passed!")

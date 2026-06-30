@@ -162,6 +162,59 @@ _SKILLS_MARKERS = (
     "### How to use skills",
 )
 
+_RUNTIME_BLOCK_REPLACEMENTS = (
+    (
+        "<environment_context>",
+        "</environment_context>",
+        "Environment context is provided by the harness.",
+    ),
+    (
+        "<permissions instructions>",
+        "</permissions instructions>",
+        (
+            "Runtime permissions apply: filesystem access may be sandboxed, network may be restricted, "
+            "and some commands may require user approval."
+        ),
+    ),
+    (
+        "<collaboration_mode>",
+        "</collaboration_mode>",
+        "Collaboration mode instructions are provided by the harness.",
+    ),
+    (
+        "<skills_instructions>",
+        "</skills_instructions>",
+        "Runtime skill metadata is available. Use relevant skills only when explicitly requested or clearly applicable.",
+    ),
+    (
+        "<plugins_instructions>",
+        "</plugins_instructions>",
+        "Runtime plugin metadata is available when relevant.",
+    ),
+    (
+        "<system-reminder>",
+        "</system-reminder>",
+        "Runtime reminder context is provided by the harness.",
+    ),
+)
+
+_RUNTIME_TAIL_MARKERS = (
+    "The following deferred tools are now available via ToolSearch.",
+    "Available agent types for the Agent tool:",
+    "The following sk​ills are available for use with the Sk​ill tool:",
+    "## MCP Server Instructions",
+)
+
+_RUNTIME_TAIL_SUMMARY = (
+    "Runtime tool, agent, skill, and MCP metadata is available separately."
+)
+
+_CODEX_CORE_SUMMARY = (
+    "You are a coding assistant in Codex CLI. Be precise, helpful, concise, and safe. "
+    "Inspect the repository, use available tools when needed, follow repository instructions, "
+    "and keep the user informed with concise progress updates."
+)
+
 
 def _zero_width_split(term: str) -> str:
     """在词内部插入零宽空格。如 'DoS' -> 'Do\\u200bS'。"""
@@ -204,6 +257,72 @@ def _looks_like_harness_user_message(content) -> bool:
     """判断 user 消息是否其实是 Codex/CLI 注入的上下文，而非用户自然输入。"""
     text = _content_to_text(content)
     return any(marker in text for marker in _HARNESS_USER_MARKERS)
+
+
+def _prune_runtime_fragments(role: str, text: str) -> str:
+    """轻量裁掉冗长的运行时元数据，保留主要行为指令。
+
+    用于 --no-compact 场景：尽量保留 Codex / Claude Code 的核心提示，
+    但移除重复的 environment / permissions / skills / tool inventory 大段文本。
+    """
+    if not text:
+        return text
+
+    pruned = text
+    for start_tag, end_tag, replacement in _RUNTIME_BLOCK_REPLACEMENTS:
+        pattern = re.compile(
+            r"\s*" + re.escape(start_tag) + r".*?" + re.escape(end_tag) + r"\s*",
+            re.DOTALL,
+        )
+        pruned = pattern.sub("\n\n" + replacement + "\n\n", pruned)
+
+    tail_indexes = [pruned.find(marker) for marker in _RUNTIME_TAIL_MARKERS if marker in pruned]
+    if tail_indexes:
+        cut = min(idx for idx in tail_indexes if idx >= 0)
+        head = pruned[:cut].rstrip()
+        pruned = f"{head}\n\n{_RUNTIME_TAIL_SUMMARY}" if head else _RUNTIME_TAIL_SUMMARY
+
+    if role == "system" and any(marker in pruned for marker in _CODEX_SYSTEM_MARKERS):
+        keep_sections: list[str] = []
+        intro_match = re.search(
+            r"^.*?(?=\n# AGENTS\.md spec|\n## Responsiveness|\n## Planning|\n## Task execution|\Z)",
+            pruned,
+            re.DOTALL,
+        )
+        if intro_match:
+            intro = intro_match.group(0).strip()
+            if intro:
+                keep_sections.append(intro)
+
+        for heading in ("## Personality", "# AGENTS.md spec"):
+            pattern = re.compile(
+                re.escape(heading) + r".*?(?=\n## |\n# |\Z)",
+                re.DOTALL,
+            )
+            match = pattern.search(pruned)
+            if match:
+                section = match.group(0).strip()
+                if section:
+                    keep_sections.append(section)
+
+        if keep_sections:
+            pruned = "\n\n".join(keep_sections)
+        else:
+            pruned = _CODEX_CORE_SUMMARY
+
+    if role == "user" and _looks_like_harness_user_message(pruned):
+        if (
+            "# AGENTS.md instructions" in pruned
+            or "<environment_context>" in text
+            or "<skills_instructions>" in text
+        ):
+            return (
+                "Repository instructions and durable user context are provided. "
+                "Follow repository guidance while answering the user's actual request."
+            )
+
+    pruned = re.sub(r"\n{3,}", "\n\n", pruned).strip()
+    return pruned
 
 
 def _compact_harness_message(role: str, content) -> str | None:
@@ -281,13 +400,13 @@ def desensitize_messages(messages: Iterable[dict],
             if compacted is not None:
                 nm["content"] = desensitize_text(compacted)
             elif isinstance(content, str):
-                nm["content"] = desensitize_text(content)
+                nm["content"] = desensitize_text(_prune_runtime_fragments(role, content))
             elif isinstance(content, list):
                 new_blocks = []
                 for blk in content:
                     if isinstance(blk, dict) and blk.get("type") == "text":
                         nb = dict(blk)
-                        nb["text"] = desensitize_text(blk.get("text", ""))
+                        nb["text"] = desensitize_text(_prune_runtime_fragments(role, blk.get("text", "")))
                         new_blocks.append(nb)
                     else:
                         new_blocks.append(blk)
