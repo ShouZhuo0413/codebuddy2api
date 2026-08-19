@@ -479,80 +479,116 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
 
 
+def _tool_calls_healthy(tool_calls) -> bool:
+    """校验聚合后的 tool_calls 是否健康（name 非空、arguments 是合法 JSON）。
+
+    后端流式返回 tool_calls 存在间歇性损坏：function.name 为空、arguments
+    为空串或非 JSON。损坏的调用会让下游 agent 报 unknown tool / 参数缺失，
+    这里检测出来以便上层触发重试。
+    """
+    if not tool_calls:
+        return True
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        name = (fn.get("name") or "").strip()
+        args = fn.get("arguments") or ""
+        if not name or not args:
+            return False
+        try:
+            json.loads(args)
+        except Exception:
+            return False
+    return True
+
+
+def _fake_sse(result: dict):
+    """把完整 chat.completion 伪装成 OpenAI SSE 流式 chunk 序列。
+
+    流式路径先聚合（_collect_stream）、校验并按需重试后，用这里把完整
+    响应拆成增量事件转发给客户端，避免透传后端损坏的 tool_calls 分片。
+    """
+    choice = (result.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content = msg.get("content") or ""
+    tcs = msg.get("tool_calls")
+    finish = choice.get("finish_reason") or "stop"
+    model = result.get("model")
+
+    def _ev(delta: dict, fr=None) -> bytes:
+        payload = {"choices": [{"index": 0, "delta": delta, "finish_reason": fr}]}
+        if model:
+            payload["model"] = model
+        return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+    yield _ev({"role": "assistant", "content": ""})
+    if content:
+        for i in range(0, len(content), 48):
+            yield _ev({"content": content[i:i + 48]})
+    if tcs:
+        # 每个 tool_call 补 index：下游按 index 聚合增量，缺失会拼接错乱
+        indexed = [dict(tc, index=i) for i, tc in enumerate(tcs)]
+        yield _ev({"tool_calls": indexed})
+    yield _ev({}, finish)
+    if result.get("usage"):
+        yield ("data: " + json.dumps({"choices": [], "usage": result["usage"]}, ensure_ascii=False) + "\n\n").encode("utf-8")
+    yield b"data: [DONE]\n\n"
+
+
 async def _stream_upstream(url: str, headers: dict, body: dict,
                            model_name: str = "?", t0: float = 0.0, rid: str = ""):
-    """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
+    """聚合后端 SSE、校验 tool_calls 完整性，损坏则重试，再伪流式转发。
 
-    同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
-    完整原始 SSE 累积后落盘到日志（调试用）。
+    后端流式返回 tool_calls 时存在间歇性损坏（name 为空、arguments 非 JSON），
+    直接透传会让下游 agent（Codex / Claude Code / dsh 等）报 unknown tool 或
+    参数缺失。这里先完整聚合（_collect_stream）、校验，损坏时重试，拿到健康
+    结果后用 _fake_sse 伪流式转发给客户端。
     """
-    finish_reason = None
-    tool_names: list[str] = []
-    usage: dict = {}
-    saw_filter = False
-    buf = b""
-    raw_parts: list[bytes] = []   # 累积完整原始 SSE
     prefix = f"[{rid}] " if rid else ""
+    collected: dict | None = None
+    max_retry = 3
 
-    def _feed(chunk: bytes):
-        nonlocal finish_reason, saw_filter, buf
-        # 行缓冲解析：把累计的 chunk 按 data: 行切出来统计
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            line = line.strip()
-            if not line.startswith(b"data:"):
-                continue
-            data = line[5:].strip()
-            if data == b"[DONE]":
-                continue
-            try:
-                obj = json.loads(data)
-            except Exception:
-                continue
-            if obj.get("usage"):
-                usage.update(obj["usage"])
-            for ch in obj.get("choices") or []:
-                if ch.get("finish_reason"):
-                    finish_reason = ch["finish_reason"]
-                for tc in (ch.get("delta") or {}).get("tool_calls") or []:
-                    nm = (tc.get("function") or {}).get("name")
-                    if nm:
-                        tool_names.append(nm)
-            # 内容审核拦截常以 content-filter 或特殊中文文案返回
-            try:
-                text_repr = data.decode("utf-8", "replace")
-            except Exception:
-                text_repr = ""
-            if "content-filter" in text_repr or "敏感" in text_repr or "审核" in text_repr:
-                saw_filter = True
+    for attempt in range(max_retry + 1):
+        try:
+            async with httpx.AsyncClient(timeout=300) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code != 200:
+                        err = await r.aread()
+                        _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
+                        _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8','replace')}")
+                        yield _err_event(err, r.status_code)
+                        return
+                    collected = await _collect_stream(r)
+        except httpx.HTTPError as e:
+            _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
+            yield _err_event(str(e).encode(), 502)
+            return
 
-    try:
-        async with httpx.AsyncClient(timeout=None) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
-                    _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8','replace')}")
-                    yield _err_event(err, r.status_code)
-                    return
-                async for chunk in r.aiter_bytes():
-                    if chunk:
-                        raw_parts.append(chunk)
-                        _feed(chunk)
-                        yield chunk
-    except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
-        yield _err_event(str(e).encode(), 502)
+        tcs = None
+        for ch in collected.get("choices") or []:
+            tcs = (ch.get("message") or {}).get("tool_calls")
+            if tcs:
+                break
+        if not isinstance(tcs, list) or _tool_calls_healthy(tcs):
+            break
+        _log(f"{prefix}▸ 流式 tool_calls 损坏（name 空/参数无效），重试 {attempt + 1}/{max_retry}")
+
+    # 伪流式转发聚合结果
+    for chunk in _fake_sse(collected):
+        yield chunk
 
     # 流结束：输出完成日志
     elapsed = time.time() - t0 if t0 else 0
-    tag = " ⚠️内容审核拦截" if (saw_filter or finish_reason == "content-filter") else ""
-    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
+    usage = collected.get("usage") or {}
+    tool_names: list[str] = []
+    for ch in collected.get("choices") or []:
+        for tc in (ch.get("message") or {}).get("tool_calls") or []:
+            nm = (tc.get("function") or {}).get("name")
+            if nm:
+                tool_names.append(nm)
+    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | stream"
          + (f" | tool_calls={tool_names}" if tool_names else "")
          + f" | tokens={usage.get('total_tokens', '?')}")
-    # 完整原始 SSE（后端返回的全部内容）
-    _log(f"{prefix}── RESPONSE RAW SSE ──\n{b''.join(raw_parts).decode('utf-8','replace')}")
+    _log(f"{prefix}── RESPONSE BODY ──\n{json.dumps(collected, ensure_ascii=False, indent=2)}")
 
 
 def _safe_err(r: httpx.Response) -> dict:
