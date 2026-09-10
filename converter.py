@@ -28,30 +28,36 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 import httpx
+import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-import uvicorn
 
 try:
     from desensitize import desensitize_body
 except ImportError:  # 模块缺失时降级为不脱敏
-    def desensitize_body(body, roles=("system",), desensitize_harness_user=False,
-                         desensitize_tools=False, compact_harness=False,
-                         strip_tool_metadata=False):
+
+    def desensitize_body(
+        body,
+        roles=("system",),
+        desensitize_harness_user=False,
+        desensitize_tools=False,
+        compact_harness=False,
+        strip_tool_metadata=False,
+    ):
         return body
 
+
+from anthropic_adapter import (
+    AnthropicStreamConverter,
+    anthropic_request_to_chat,
+)
 from responses_adapter import (
-    responses_request_to_chat,
     ResponsesStreamConverter,
+    responses_request_to_chat,
 )
 from responses_projection import project_responses_chat_body
-from anthropic_adapter import (
-    anthropic_request_to_chat,
-    AnthropicStreamConverter,
-)
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -65,6 +71,7 @@ USER_AGENT = "codebuddy2openai/2.0"
 # 平台相关：定位 auth 目录
 # ---------------------------------------------------------------------------
 
+
 def auth_dirs() -> list[Path]:
     env_dir = os.environ.get("CODEBUDDY_AUTH_DIR")
     if env_dir:
@@ -72,7 +79,15 @@ def auth_dirs() -> list[Path]:
     home = Path.home()
     plat = sys.platform
     if plat == "darwin":
-        return [home / "Library" / "Application Support" / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
+        return [
+            home
+            / "Library"
+            / "Application Support"
+            / "CodeBuddyExtension"
+            / "Data"
+            / "Public"
+            / "auth"
+        ]
     if plat == "win32":
         local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
         return [local / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
@@ -92,6 +107,7 @@ def find_auth_file() -> Path | None:
 # Auth 凭据管理（读 + 自动刷新 + 回写）
 # ---------------------------------------------------------------------------
 
+
 class CredentialManager:
     """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
 
@@ -102,7 +118,7 @@ class CredentialManager:
         self._mtime: float = 0.0
 
     def _read_raw(self) -> dict:
-        with open(self.path, "r", encoding="utf-8") as f:
+        with open(self.path, encoding="utf-8") as f:
             return json.load(f)
 
     def _load_if_stale(self):
@@ -149,9 +165,13 @@ class CredentialManager:
         new_auth["lastRefreshTime"] = int(time.time() * 1000)
         # 计算 expiresAt（若后端没直接给）
         if not new_auth.get("expiresAt") and new_auth.get("expiresIn"):
-            new_auth["expiresAt"] = int(time.time() * 1000) + new_auth["expiresIn"] * 1000
+            new_auth["expiresAt"] = (
+                int(time.time() * 1000) + new_auth["expiresIn"] * 1000
+            )
         if not new_auth.get("refreshExpiresAt") and new_auth.get("refreshExpiresIn"):
-            new_auth["refreshExpiresAt"] = int(time.time() * 1000) + new_auth["refreshExpiresIn"] * 1000
+            new_auth["refreshExpiresAt"] = (
+                int(time.time() * 1000) + new_auth["refreshExpiresIn"] * 1000
+            )
         s["auth"] = new_auth
         # 原子写回
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -166,7 +186,7 @@ class CredentialManager:
         h = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "Authorization": f"Bearer {auth.get('accessToken','')}",
+            "Authorization": f"Bearer {auth.get('accessToken', '')}",
             "X-User-Id": account.get("uid", ""),
             "X-Enterprise-Id": account.get("enterpriseId", ""),
             "X-Tenant-Id": account.get("enterpriseId", ""),
@@ -202,19 +222,182 @@ class CredentialManager:
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODELS = [
-    "glm-5.2", "glm-5.1", "glm-5v-turbo",
-    "kimi-k2.7", "kimi-k2.6", "kimi-k2.5",
-    "deepseek-v4-pro", "deepseek-v4-flash",
-    "minimax-m3-pay", "hy3-preview-agent", "auto",
+    "glm-5.2",
+    "glm-5.1",
+    "glm-5v-turbo",
+    "kimi-k2.7",
+    "kimi-k2.6",
+    "kimi-k2.5",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "minimax-m3-pay",
+    "hy3-preview-agent",
+    "auto",
 ]
+
+# 标识非聊天模型的 tag（需要过滤掉）
+NON_CHAT_MODEL_TAGS = {
+    "text-to-image",
+    "image-to-image",
+    "text-to-video",
+}
+
+
+def _find_workbuddy_product_json() -> Path | None:
+    """
+    查找本机 WorkBuddy 应用的 product.json 配置文件。
+
+    WorkBuddy 在安装时会自动解压 asar 到 app.asar.unpacked 目录，
+    因此无需用户手动提取。
+
+    macOS: /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/product.json
+    Windows: %LOCALAPPDATA%\\Programs\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\product.json
+    Linux: /opt/WorkBuddy/resources/app.asar.unpacked/cli/product.json
+
+    Returns:
+        Path 对象如果找到配置文件，否则 None
+    """
+    possible_paths = []
+
+    if sys.platform == "darwin":  # macOS
+        possible_paths.extend(
+            [
+                # 标准安装路径（WorkBuddy 自动解压）
+                Path(
+                    "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/product.json"
+                ),
+                # 开发/调试：本地提取的目录
+                Path.home()
+                / "Desktop/workspace/opensource/codebuddy2api/workbuddy_extracted/cli/product.json",
+            ]
+        )
+    elif sys.platform == "win32":  # Windows
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
+        possible_paths.extend(
+            [
+                local_app_data
+                / "Programs/WorkBuddy/resources/app.asar.unpacked/cli/product.json",
+                Path(
+                    "C:/Program Files/WorkBuddy/resources/app.asar.unpacked/cli/product.json"
+                ),
+            ]
+        )
+    else:  # Linux
+        possible_paths.extend(
+            [
+                Path("/opt/WorkBuddy/resources/app.asar.unpacked/cli/product.json"),
+                Path.home() / ".local/share/WorkBuddy/cli/product.json",
+            ]
+        )
+
+    for path in possible_paths:
+        if path.exists() and path.is_file():
+            return path
+
+    return None
+
+
+def _load_models_from_workbuddy() -> list[str]:
+    """
+    从本机 WorkBuddy product.json 读取模型列表。
+
+    过滤规则：
+    1. 只保留聊天模型（排除 text-to-image, text-to-video 等）
+    2. 排除 vendor 为 "tencent" 的内部模型（通常是补全/内部专用）
+    3. 返回模型 ID 列表
+
+    Returns:
+        模型 ID 列表，如果加载失败返回空列表
+    """
+    product_json_path = _find_workbuddy_product_json()
+
+    if product_json_path is None:
+        return []
+
+    try:
+        with open(product_json_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        models = data.get("models", [])
+        chat_models = []
+
+        for model in models:
+            model_id = model.get("id")
+            if not model_id:
+                continue
+
+            # 过滤掉非聊天模型
+            tags = model.get("tags", [])
+            if any(tag in NON_CHAT_MODEL_TAGS for tag in tags):
+                continue
+
+            # 过滤掉内部模型（vendor 为 tencent 的通常是补全/跳转等内部功能）
+            vendor = model.get("vendor", "")
+            if vendor == "tencent":
+                continue
+
+            # 过滤掉名称中明显是补全/内部功能的模型
+            name_lower = model_id.lower()
+            if any(
+                keyword in name_lower
+                for keyword in ["completion", "rewrite", "jump", "codewise"]
+            ):
+                continue
+
+            chat_models.append(model_id)
+
+        return chat_models
+
+    except Exception as e:
+        # 解析失败时静默降级，不影响服务启动
+        print(
+            f"Warning: Failed to load models from WorkBuddy product.json: {e}",
+            file=sys.stderr,
+        )
+        return []
+
+
+def get_available_models() -> list[str]:
+    """
+    获取可用的模型列表。
+
+    优先从 WorkBuddy product.json 读取，如果失败则使用 DEFAULT_MODELS。
+
+    Returns:
+        模型 ID 列表
+    """
+    workbuddy_models = _load_models_from_workbuddy()
+
+    if workbuddy_models:
+        # 成功从 WorkBuddy 加载，使用动态列表
+        return workbuddy_models
+    else:
+        # 降级到硬编码列表
+        return DEFAULT_MODELS
+
 
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
 PASSTHROUGH_BODY_KEYS = {
-    "model", "messages", "tools", "tool_choice", "temperature",
-    "max_tokens", "max_completion_tokens", "top_p", "stream",
-    "stream_options", "stop", "presence_penalty", "frequency_penalty",
-    "n", "response_format", "seed", "user", "reasoning_effort",
-    "verbosity", "reasoning_summary",
+    "model",
+    "messages",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "max_tokens",
+    "max_completion_tokens",
+    "top_p",
+    "stream",
+    "stream_options",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "n",
+    "response_format",
+    "seed",
+    "user",
+    "reasoning_effort",
+    "verbosity",
+    "reasoning_summary",
 }
 
 # ---------------------------------------------------------------------------
@@ -222,8 +405,13 @@ PASSTHROUGH_BODY_KEYS = {
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="codebuddy2openai", version="2.0")
-CONFIG: dict = {"api_key": "", "cred": None, "log_path": None,
-                "desensitize": False, "no_compact": False}  # cred: CredentialManager | None
+CONFIG: dict = {
+    "api_key": "",
+    "cred": None,
+    "log_path": None,
+    "desensitize": False,
+    "no_compact": False,
+}  # cred: CredentialManager | None
 
 
 # ---------------------------------------------------------------------------
@@ -240,13 +428,10 @@ def _log(msg: str):
         return
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
     try:
-        with _LOG_LOCK:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line)
+        with _LOG_LOCK, open(path, "a", encoding="utf-8") as f:
+            f.write(line)
     except OSError:
         pass  # 日志失败不应影响主流程
-
-
 
 
 def _truncate(s: str, n: int = 80) -> str:
@@ -254,7 +439,7 @@ def _truncate(s: str, n: int = 80) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
-def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
+def _check_auth(authorization: str | None, x_api_key: str | None):
     key = CONFIG["api_key"]
     if not key:
         return
@@ -264,20 +449,36 @@ def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
     if not token and x_api_key:
         token = x_api_key
     if token != key:
-        raise HTTPException(status_code=401, detail={"error": {"message": "invalid api key", "type": "auth_error"}})
+        raise HTTPException(
+            status_code=401,
+            detail={"error": {"message": "invalid api key", "type": "auth_error"}},
+        )
 
 
 def _cred() -> CredentialManager:
     if CONFIG["cred"] is None:
-        raise HTTPException(status_code=503, detail={"error": {"message": "未找到登录凭据，请先在桌面端登录 CodeBuddy/WorkBuddy", "type": "auth_error"}})
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "未找到登录凭据，请先在桌面端登录 CodeBuddy/WorkBuddy",
+                    "type": "auth_error",
+                }
+            },
+        )
     return CONFIG["cred"]
 
 
 @app.get("/health")
 def health():
     cred = CONFIG["cred"]
-    info: dict = {"status": "ok", "platform": sys.platform, "python": sys.version.split()[0],
-                  "auth_file": str(find_auth_file() or "(未找到)"), "mode": "direct-proxy (native function calling)"}
+    info: dict = {
+        "status": "ok",
+        "platform": sys.platform,
+        "python": sys.version.split()[0],
+        "auth_file": str(find_auth_file() or "(未找到)"),
+        "mode": "direct-proxy (native function calling)",
+    }
     if cred is not None:
         try:
             info["credential"] = cred.summary()
@@ -287,29 +488,49 @@ def health():
 
 
 @app.get("/v1/models")
-def list_models(authorization: Optional[str] = Header(default=None),
-                x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+def list_models(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
     _check_auth(authorization, x_api_key)
-    data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
-            for m in DEFAULT_MODELS]
+    models = get_available_models()
+    data = [
+        {"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
+        for m in models
+    ]
     return {"object": "list", "data": data}
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request,
-                           authorization: Optional[str] = Header(default=None),
-                           x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+async def chat_completions(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
     _check_auth(authorization, x_api_key)
     cred = _cred()
 
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {"message": f"bad json: {e}", "type": "invalid_request_error"}
+            },
+        )
 
     messages = payload.get("messages") or []
     if not messages:
-        raise HTTPException(status_code=400, detail={"error": {"message": "messages is required", "type": "invalid_request_error"}})
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": "messages is required",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
 
     # 构造后端 body：只透传已知的合法字段
     client_wants_stream = bool(payload.get("stream"))
@@ -323,30 +544,42 @@ async def chat_completions(request: Request,
     # 腾讯后端不支持 developer role，遇到会触发安全策略拦截（11128），统一映射为 system
     if "messages" in body and isinstance(body["messages"], list):
         body["messages"] = [
-            dict(m, role="system") if isinstance(m, dict) and m.get("role") == "developer" else m
+            dict(m, role="system")
+            if isinstance(m, dict) and m.get("role") == "developer"
+            else m
             for m in body["messages"]
         ]
 
     # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
     # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
     if CONFIG.get("desensitize"):
-        body = desensitize_body(body, roles=("system", "developer"),
-                                desensitize_harness_user=True,
-                                desensitize_tools=True,
-                                compact_harness=not CONFIG.get("no_compact"),
-                                strip_tool_metadata=True)
+        body = desensitize_body(
+            body,
+            roles=("system", "developer"),
+            desensitize_harness_user=True,
+            desensitize_tools=True,
+            compact_harness=not CONFIG.get("no_compact"),
+            strip_tool_metadata=True,
+        )
 
     # 日志：请求摘要
     model_name = payload.get("model", "auto")
-    tool_names = [t.get("function", {}).get("name") for t in (payload.get("tools") or [])
-                  if isinstance(t, dict)]
+    tool_names = [
+        t.get("function", {}).get("name")
+        for t in (payload.get("tools") or [])
+        if isinstance(t, dict)
+    ]
     last_user = _last_user_text(messages)
     rid = os.urandom(4).hex()
-    _log(f"[{rid}] ▶ REQUEST {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
-         + (f" | tools={tool_names}" if tool_names else "")
-         + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
+    _log(
+        f"[{rid}] ▶ REQUEST {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
+        + (f" | tools={tool_names}" if tool_names else "")
+        + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else "")
+    )
     # 完整请求体（发往后端的实际内容；若启用脱敏，这里已是脱敏后）
-    _log(f"[{rid}] ── REQUEST BODY (发往后端) ──\n{json.dumps(body, ensure_ascii=False, indent=2)}")
+    _log(
+        f"[{rid}] ── REQUEST BODY (发往后端) ──\n{json.dumps(body, ensure_ascii=False, indent=2)}"
+    )
 
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
@@ -365,15 +598,25 @@ async def chat_completions(request: Request,
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
-                    _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
-                    _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
-                    raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
+                    _log(
+                        f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
+                    )
+                    _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8', 'replace')}")
+                    raise HTTPException(
+                        status_code=r.status_code,
+                        detail=_safe_err_raw(raw, r.status_code),
+                    )
                 collected = await _collect_stream(r)
     except HTTPException:
         raise
     except httpx.HTTPError as e:
         _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
-        raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": {"message": f"upstream error: {e}", "type": "upstream_error"}
+            },
+        )
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
 
@@ -406,11 +649,15 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
     if finish == "content-filter":
         tag = " ⚠️内容审核拦截"
     tc_names = [t.get("function", {}).get("name") for t in tcs]
-    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | finish={finish}{tag}"
-         + (f" | tool_calls={tc_names}" if tc_names else "")
-         + f" | tokens={usage.get('total_tokens', '?')}")
+    _log(
+        f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | finish={finish}{tag}"
+        + (f" | tool_calls={tc_names}" if tc_names else "")
+        + f" | tokens={usage.get('total_tokens', '?')}"
+    )
     # 完整响应体
-    _log(f"{prefix}── RESPONSE BODY ──\n{json.dumps(result, ensure_ascii=False, indent=2)}")
+    _log(
+        f"{prefix}── RESPONSE BODY ──\n{json.dumps(result, ensure_ascii=False, indent=2)}"
+    )
 
 
 async def _collect_stream(response: httpx.Response) -> dict:
@@ -447,7 +694,9 @@ async def _collect_stream(response: httpx.Response) -> dict:
                 content_parts.append(delta["content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
-                slot = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+                slot = tool_calls.setdefault(
+                    idx, {"id": None, "name": None, "arguments": ""}
+                )
                 if tc.get("id"):
                     slot["id"] = tc["id"]
                 fn = tc.get("function") or {}
@@ -459,8 +708,11 @@ async def _collect_stream(response: httpx.Response) -> dict:
     tcs = None
     if tool_calls:
         tcs = [
-            {"id": v["id"], "type": "function",
-             "function": {"name": v["name"], "arguments": v["arguments"]}}
+            {
+                "id": v["id"],
+                "type": "function",
+                "function": {"name": v["name"], "arguments": v["arguments"]},
+            }
             for _, v in sorted(tool_calls.items())
         ]
         finish_reason = finish_reason or "tool_calls"
@@ -473,9 +725,11 @@ async def _collect_stream(response: httpx.Response) -> dict:
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model or "unknown",
-        "choices": [{"index": 0, "message": message,
-                     "finish_reason": finish_reason or "stop"}],
-        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "choices": [
+            {"index": 0, "message": message, "finish_reason": finish_reason or "stop"}
+        ],
+        "usage": usage
+        or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
@@ -483,11 +737,23 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
     try:
         return json.loads(raw.decode("utf-8", "replace"))
     except Exception:
-        return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
+        return {
+            "error": {
+                "message": raw.decode("utf-8", "replace")[:500],
+                "type": "upstream_error",
+                "code": status,
+            }
+        }
 
 
-async def _stream_upstream(url: str, headers: dict, body: dict,
-                           model_name: str = "?", t0: float = 0.0, rid: str = ""):
+async def _stream_upstream(
+    url: str,
+    headers: dict,
+    body: dict,
+    model_name: str = "?",
+    t0: float = 0.0,
+    rid: str = "",
+):
     """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
 
     同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
@@ -498,7 +764,7 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
     usage: dict = {}
     saw_filter = False
     buf = b""
-    raw_parts: list[bytes] = []   # 累积完整原始 SSE
+    raw_parts: list[bytes] = []  # 累积完整原始 SSE
     prefix = f"[{rid}] " if rid else ""
 
     def _feed(chunk: bytes):
@@ -531,7 +797,11 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                 text_repr = data.decode("utf-8", "replace")
             except Exception:
                 text_repr = ""
-            if "content-filter" in text_repr or "敏感" in text_repr or "审核" in text_repr:
+            if (
+                "content-filter" in text_repr
+                or "敏感" in text_repr
+                or "审核" in text_repr
+            ):
                 saw_filter = True
 
     try:
@@ -539,8 +809,10 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
-                    _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
-                    _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8','replace')}")
+                    _log(
+                        f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
+                    )
+                    _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8', 'replace')}")
                     yield _err_event(err, r.status_code)
                     return
                 async for chunk in r.aiter_bytes():
@@ -555,27 +827,42 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
     # 流结束：输出完成日志
     elapsed = time.time() - t0 if t0 else 0
     tag = " ⚠️内容审核拦截" if (saw_filter or finish_reason == "content-filter") else ""
-    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
-         + (f" | tool_calls={tool_names}" if tool_names else "")
-         + f" | tokens={usage.get('total_tokens', '?')}")
+    _log(
+        f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
+        + (f" | tool_calls={tool_names}" if tool_names else "")
+        + f" | tokens={usage.get('total_tokens', '?')}"
+    )
     # 完整原始 SSE（后端返回的全部内容）
-    _log(f"{prefix}── RESPONSE RAW SSE ──\n{b''.join(raw_parts).decode('utf-8','replace')}")
+    _log(
+        f"{prefix}── RESPONSE RAW SSE ──\n{b''.join(raw_parts).decode('utf-8', 'replace')}"
+    )
 
 
 def _safe_err(r: httpx.Response) -> dict:
     try:
         return {"error": r.json()}
     except Exception:
-        return {"error": {"message": r.text[:500], "type": "upstream_error", "code": r.status_code}}
+        return {
+            "error": {
+                "message": r.text[:500],
+                "type": "upstream_error",
+                "code": r.status_code,
+            }
+        }
 
 
 def _err_event(msg: bytes, status: int) -> bytes:
     # 以 OpenAI SSE 错误 chunk 形式返回
-    import json as _json, time as _time
+    import json as _json
+
     chunk = {
-        "error": {"message": msg.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status},
+        "error": {
+            "message": msg.decode("utf-8", "replace")[:500],
+            "type": "upstream_error",
+            "code": status,
+        },
     }
-    return f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+    return f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
 
 
 def _looks_like_content_filter_text(text: str) -> bool:
@@ -612,15 +899,25 @@ async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, 
             return r.status_code, b"".join(chunks)
 
 
-async def _post_backend_with_filter_retry(url: str, headers: dict, body: dict,
-                                          rid: str = "", model_name: str = "?") -> tuple[int, bytes, dict]:
+async def _post_backend_with_filter_retry(
+    url: str, headers: dict, body: dict, rid: str = "", model_name: str = "?"
+) -> tuple[int, bytes, dict]:
     prefix = f"[{rid}] " if rid else ""
     status, raw = await _post_backend_once(url, headers, body)
     text = raw.decode("utf-8", "replace")
-    if status == 200 and _looks_like_content_filter_text(text) and CONFIG.get("desensitize") and CONFIG.get("no_compact"):
+    if (
+        status == 200
+        and _looks_like_content_filter_text(text)
+        and CONFIG.get("desensitize")
+        and CONFIG.get("no_compact")
+    ):
         retry_body = _chat_body_desensitize(body, force_compact=True)
-        _log(f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness")
-        _log(f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}")
+        _log(
+            f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness"
+        )
+        _log(
+            f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}"
+        )
         retry_status, retry_raw = await _post_backend_once(url, headers, retry_body)
         retry_text = retry_raw.decode("utf-8", "replace")
         if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
@@ -632,10 +929,13 @@ async def _post_backend_with_filter_retry(url: str, headers: dict, body: dict,
 # Responses API 端点（Codex CLI 兼容）
 # ---------------------------------------------------------------------------
 
+
 @app.post("/v1/responses")
-async def create_response(request: Request,
-                          authorization: Optional[str] = Header(default=None),
-                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+async def create_response(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
     """OpenAI Responses API 兼容端点。
 
     Codex CLI 使用 Responses API（wire_api = "responses"）而非 Chat Completions。
@@ -648,13 +948,26 @@ async def create_response(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {"message": f"bad json: {e}", "type": "invalid_request_error"}
+            },
+        )
 
     # 转换请求：Responses → Chat
     try:
         chat_body = responses_request_to_chat(payload)
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": f"request conversion error: {e}",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
 
     chat_body, projection_stats = project_responses_chat_body(chat_body)
     chat_body.setdefault("model", "auto")
@@ -667,7 +980,9 @@ async def create_response(request: Request,
     client_wants_stream = payload.get("stream", True)  # Codex CLI 默认 stream
     model_name = payload.get("model", "auto")
     rid = os.urandom(4).hex()
-    _log(f"[{rid}] ▶ RESPONSES {model_name} | stream={client_wants_stream} | input_items={len(payload.get('input', []))}")
+    _log(
+        f"[{rid}] ▶ RESPONSES {model_name} | stream={client_wants_stream} | input_items={len(payload.get('input', []))}"
+    )
     _log(
         f"[{rid}] ── RESPONSES PROJECTION ── "
         f"mode={projection_stats.get('mode')} "
@@ -679,7 +994,9 @@ async def create_response(request: Request,
         f"| dropped_harness={projection_stats.get('dropped_harness_messages', 0)} "
         f"| anchor_user={projection_stats.get('anchor_user_preserved', False)}"
     )
-    _log(f"[{rid}] ── RESPONSES → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}")
+    _log(
+        f"[{rid}] ── RESPONSES → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
+    )
 
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
@@ -694,10 +1011,16 @@ async def create_response(request: Request,
 
     # 非流式：聚合后端 SSE → 非流式 Response 对象
     try:
-        status_code, raw, final_body = await _post_backend_with_filter_retry(url, headers, chat_body, rid, model_name)
+        status_code, raw, final_body = await _post_backend_with_filter_retry(
+            url, headers, chat_body, rid, model_name
+        )
         if status_code != 200:
-            _log(f"[{rid}] ✗ HTTP {status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
-            raise HTTPException(status_code=status_code, detail=_safe_err_raw(raw, status_code))
+            _log(
+                f"[{rid}] ✗ HTTP {status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
+            )
+            raise HTTPException(
+                status_code=status_code, detail=_safe_err_raw(raw, status_code)
+            )
         converter = ResponsesStreamConverter(model=model_name)
         for line in raw.decode("utf-8", "replace").splitlines():
             converter.feed_line(line)
@@ -706,27 +1029,50 @@ async def create_response(request: Request,
         raise
     except httpx.HTTPError as e:
         _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
-        raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": {"message": f"upstream error: {e}", "type": "upstream_error"}
+            },
+        )
 
     result = converter.get_nonstream_response()
     elapsed = time.time() - t0
     _log(f"[{rid}] ◀ RESPONSES {model_name} | {elapsed:.1f}s")
-    _log(f"[{rid}] ── RESPONSE OBJ ──\n{json.dumps(result, ensure_ascii=False, indent=2)}")
+    _log(
+        f"[{rid}] ── RESPONSE OBJ ──\n{json.dumps(result, ensure_ascii=False, indent=2)}"
+    )
     return JSONResponse(content=result)
 
 
-async def _stream_responses(url: str, headers: dict, body: dict,
-                            model_name: str = "?", t0: float = 0.0, rid: str = ""):
+async def _stream_responses(
+    url: str,
+    headers: dict,
+    body: dict,
+    model_name: str = "?",
+    t0: float = 0.0,
+    rid: str = "",
+):
     """消费后端 Chat SSE，实时转换为 Responses API 事件流输出。"""
     converter = ResponsesStreamConverter(model=model_name)
     prefix = f"[{rid}] " if rid else ""
 
     try:
-        status_code, raw, _ = await _post_backend_with_filter_retry(url, headers, body, rid, model_name)
+        status_code, raw, _ = await _post_backend_with_filter_retry(
+            url, headers, body, rid, model_name
+        )
         if status_code != 200:
-            _log(f"{prefix}✗ HTTP {status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
-            error_evt = {"type": "error", "error": {"message": raw.decode('utf-8','replace')[:500], "code": status_code}}
-            yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
+            _log(
+                f"{prefix}✗ HTTP {status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
+            )
+            error_evt = {
+                "type": "error",
+                "error": {
+                    "message": raw.decode("utf-8", "replace")[:500],
+                    "code": status_code,
+                },
+            }
+            yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
             return
         raw_sse_lines = []
         for line in raw.decode("utf-8", "replace").splitlines():
@@ -738,7 +1084,7 @@ async def _stream_responses(url: str, headers: dict, body: dict,
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         error_evt = {"type": "error", "error": {"message": str(e)[:500], "code": 502}}
-        yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
+        yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
         return
 
     # 发送收尾事件
@@ -755,10 +1101,13 @@ async def _stream_responses(url: str, headers: dict, body: dict,
 # Anthropic Messages API 端点（Claude Code / CC Switch 兼容）
 # ---------------------------------------------------------------------------
 
+
 @app.post("/v1/messages")
-async def create_message(request: Request,
-                         authorization: Optional[str] = Header(default=None),
-                         x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+async def create_message(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
     """Anthropic Messages API 兼容端点。
 
     Claude Code / CC Switch 使用 Anthropic Messages API（POST /v1/messages）。
@@ -771,17 +1120,38 @@ async def create_message(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {"message": f"bad json: {e}", "type": "invalid_request_error"}
+            },
+        )
 
     # 将 Anthropic 格式消息、工具规范在进入后端前统一转换为 OpenAI Chat 格式。
     messages = payload.get("messages") or []
     if not messages:
-        raise HTTPException(status_code=400, detail={"error": {"message": "messages is required", "type": "invalid_request_error"}})
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": "messages is required",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
 
     try:
         chat_body = anthropic_request_to_chat(payload)
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": f"request conversion error: {e}",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
 
     chat_body.setdefault("model", "auto")
     chat_body["stream"] = True
@@ -789,17 +1159,24 @@ async def create_message(request: Request,
         chat_body["stream_options"] = {"include_usage": True}
 
     if CONFIG.get("desensitize"):
-        chat_body = desensitize_body(chat_body, roles=("system", "developer"),
-                                     desensitize_harness_user=True,
-                                     desensitize_tools=True,
-                                     compact_harness=not CONFIG.get("no_compact"),
-                                     strip_tool_metadata=True)
+        chat_body = desensitize_body(
+            chat_body,
+            roles=("system", "developer"),
+            desensitize_harness_user=True,
+            desensitize_tools=True,
+            compact_harness=not CONFIG.get("no_compact"),
+            strip_tool_metadata=True,
+        )
 
     model_name = payload.get("model", "auto")
     chat_messages = chat_body.get("messages", [])
     rid = os.urandom(4).hex()
-    _log(f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}")
-    _log(f"[{rid}] ── ANTHROPIC → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}")
+    _log(
+        f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}"
+    )
+    _log(
+        f"[{rid}] ── ANTHROPIC → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
+    )
 
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
@@ -812,8 +1189,14 @@ async def create_message(request: Request,
     )
 
 
-async def _stream_anthropic(url: str, headers: dict, body: dict,
-                            model_name: str = "?", t0: float = 0.0, rid: str = ""):
+async def _stream_anthropic(
+    url: str,
+    headers: dict,
+    body: dict,
+    model_name: str = "?",
+    t0: float = 0.0,
+    rid: str = "",
+):
     """消费后端 OpenAI Chat SSE，实时转换为 Anthropic Messages SSE 事件流。"""
     converter = AnthropicStreamConverter(model=model_name)
     prefix = f"[{rid}] " if rid else ""
@@ -823,9 +1206,18 @@ async def _stream_anthropic(url: str, headers: dict, body: dict,
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
-                    _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
-                    error_evt = {"type": "error", "error": {"message": err.decode('utf-8','replace')[:500], "type": "api_error", "code": r.status_code}}
-                    yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
+                    _log(
+                        f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
+                    )
+                    error_evt = {
+                        "type": "error",
+                        "error": {
+                            "message": err.decode("utf-8", "replace")[:500],
+                            "type": "api_error",
+                            "code": r.status_code,
+                        },
+                    }
+                    yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
                     return
                 async for line in r.aiter_lines():
                     events = converter.feed_line(line)
@@ -833,8 +1225,11 @@ async def _stream_anthropic(url: str, headers: dict, body: dict,
                         yield events.encode("utf-8")
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
-        error_evt = {"type": "error", "error": {"message": str(e)[:500], "type": "api_error", "code": 502}}
-        yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
+        error_evt = {
+            "type": "error",
+            "error": {"message": str(e)[:500], "type": "api_error", "code": 502},
+        }
+        yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
         return
 
     finish_events = converter.finish()
@@ -846,9 +1241,11 @@ async def _stream_anthropic(url: str, headers: dict, body: dict,
 
 
 @app.post("/v1/messages/count_tokens")
-async def count_tokens(request: Request,
-                       authorization: Optional[str] = Header(default=None),
-                       x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+async def count_tokens(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
     """Anthropic token 计数端点（stub）。
 
     Claude Code 可能在发送消息前调用此端点。
@@ -862,6 +1259,7 @@ async def count_tokens(request: Request,
 # 启动
 # ---------------------------------------------------------------------------
 
+
 def preflight() -> bool:
     af = find_auth_file()
     sys.stderr.write("==== 预检 ====\n")
@@ -873,14 +1271,20 @@ def preflight() -> bool:
         sys.stderr.write(f"已查目录  : {', '.join(str(d) for d in auth_dirs())}\n")
     ok = True
     if af is None:
-        sys.stderr.write("\n[警告] 未找到登录文件。请在桌面端完成登录（CodeBuddy/WorkBuddy）。\n")
+        sys.stderr.write(
+            "\n[警告] 未找到登录文件。请在桌面端完成登录（CodeBuddy/WorkBuddy）。\n"
+        )
         ok = False
     else:
         try:
             cm = CredentialManager(af)
             info = cm.summary()
-            sys.stderr.write(f"账号      : {info.get('nickname')} / {info.get('enterpriseName')}\n")
-            sys.stderr.write(f"token过期 : {'是(将自动刷新)' if info['token_expired'] else '否'}\n")
+            sys.stderr.write(
+                f"账号      : {info.get('nickname')} / {info.get('enterpriseName')}\n"
+            )
+            sys.stderr.write(
+                f"token过期 : {'是(将自动刷新)' if info['token_expired'] else '否'}\n"
+            )
         except Exception as e:
             sys.stderr.write(f"[警告] 读取凭据失败：{e}\n")
             ok = False
@@ -889,21 +1293,36 @@ def preflight() -> bool:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CodeBuddy -> OpenAI 兼容转换器（直连后端）")
+    ap = argparse.ArgumentParser(
+        description="CodeBuddy -> OpenAI 兼容转换器（直连后端）"
+    )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--api-key", default=os.environ.get("CODEBUDDY2OPENAI_KEY", ""),
-                    help="可选：要求客户端携带的 API key（默认不校验）")
-    ap.add_argument("--log", default=None, metavar="PATH",
-                    help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
-                         "不传则不记日志。")
-    ap.add_argument("--desensitize", action="store_true",
-                    help="启用脱敏：对 system 消息里的合规模板敏感词（DoS/exploit/credential 等）"
-                         "插入零宽空格，缓解被后端内容审核误拦。默认关闭。")
-    ap.add_argument("--no-compact", action="store_true",
-                    help="配合 --desensitize 使用：跳过 system/harness 压缩，仅做零宽脱敏。"
-                         "保留原始 system prompt 完整内容（如 Claude Code 的行为指令），"
-                         "但审核误拦风险略高于默认压缩模式。")
+    ap.add_argument(
+        "--api-key",
+        default=os.environ.get("CODEBUDDY2OPENAI_KEY", ""),
+        help="可选：要求客户端携带的 API key（默认不校验）",
+    )
+    ap.add_argument(
+        "--log",
+        default=None,
+        metavar="PATH",
+        help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
+        "不传则不记日志。",
+    )
+    ap.add_argument(
+        "--desensitize",
+        action="store_true",
+        help="启用脱敏：对 system 消息里的合规模板敏感词（DoS/exploit/credential 等）"
+        "插入零宽空格，缓解被后端内容审核误拦。默认关闭。",
+    )
+    ap.add_argument(
+        "--no-compact",
+        action="store_true",
+        help="配合 --desensitize 使用：跳过 system/harness 压缩，仅做零宽脱敏。"
+        "保留原始 system prompt 完整内容（如 Claude Code 的行为指令），"
+        "但审核误拦风险略高于默认压缩模式。",
+    )
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     args = ap.parse_args()
 
@@ -911,18 +1330,26 @@ def main():
     CONFIG["desensitize"] = args.desensitize
     CONFIG["no_compact"] = args.no_compact
     # --log 直接指定文件路径即开启；不传则不记
-    CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
+    CONFIG["log_path"] = (
+        args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
+    )
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
 
     if not args.skip_check:
         preflight()
 
-    sys.stderr.write(f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n")
+    sys.stderr.write(
+        f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n"
+    )
     sys.stderr.write("   GET  /v1/models\n")
-    sys.stderr.write("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n")
+    sys.stderr.write(
+        "   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n"
+    )
     sys.stderr.write("   POST /v1/responses          (Responses API，Codex CLI 兼容)\n")
-    sys.stderr.write("   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)\n")
+    sys.stderr.write(
+        "   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)\n"
+    )
     sys.stderr.write("   GET  /health\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
@@ -934,7 +1361,7 @@ def main():
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
 
     # 启动时写一条标记
-    _log(f"==== converter 启动 ====")
+    _log("==== converter 启动 ====")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
