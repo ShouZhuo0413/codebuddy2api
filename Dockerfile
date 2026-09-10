@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY converter.py responses_adapter.py anthropic_adapter.py desensitize.py ./
+COPY converter.py responses_adapter.py responses_projection.py anthropic_adapter.py desensitize.py ./
 
 EXPOSE 8787
 
