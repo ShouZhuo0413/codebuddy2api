@@ -1154,6 +1154,9 @@ async def create_message(
         )
 
     chat_body.setdefault("model", "auto")
+    # 读取用户的 stream 参数，如果未提供则默认为 True
+    user_stream = payload.get("stream", True)
+    # 无论用户如何设置，都向后端请求流式响应（后端只支持流式）
     chat_body["stream"] = True
     if "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
@@ -1172,7 +1175,7 @@ async def create_message(
     chat_messages = chat_body.get("messages", [])
     rid = os.urandom(4).hex()
     _log(
-        f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}"
+        f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)} | user_stream={user_stream}"
     )
     _log(
         f"[{rid}] ── ANTHROPIC → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
@@ -1182,11 +1185,67 @@ async def create_message(
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
 
-    return StreamingResponse(
-        _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    # 如果用户请求流式响应，直接返回流式
+    if user_stream:
+        return StreamingResponse(
+            _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # 否则，收集完整响应并返回 JSON
+    from fastapi.responses import JSONResponse
+
+    response_data = await _collect_anthropic_nonstream(
+        url, headers, chat_body, model_name, t0, rid
     )
+    return JSONResponse(content=response_data)
+
+
+async def _collect_anthropic_nonstream(
+    url: str,
+    headers: dict,
+    body: dict,
+    model_name: str = "?",
+    t0: float = 0.0,
+    rid: str = "",
+) -> dict:
+    """收集完整的流式响应并返回非流式 Anthropic Message 对象。"""
+    converter = AnthropicStreamConverter(model=model_name)
+    prefix = f"[{rid}] " if rid else ""
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as c:
+            async with c.stream("POST", url, headers=headers, json=body) as r:
+                if r.status_code != 200:
+                    err = await r.aread()
+                    _log(
+                        f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
+                    )
+                    raise HTTPException(
+                        status_code=r.status_code,
+                        detail={
+                            "error": {
+                                "message": err.decode("utf-8", "replace")[:500],
+                                "type": "api_error",
+                                "code": r.status_code,
+                            }
+                        },
+                    )
+                async for line in r.aiter_lines():
+                    converter.feed_line(line)
+    except httpx.HTTPError as e:
+        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": {"message": str(e)[:500], "type": "api_error", "code": 502}
+            },
+        ) from None
+
+    elapsed = time.time() - t0 if t0 else 0
+    _log(f"{prefix}◀ ANTHROPIC {model_name} | {elapsed:.1f}s | nonstream done")
+    return converter.get_nonstream_response()
 
 
 async def _stream_anthropic(
