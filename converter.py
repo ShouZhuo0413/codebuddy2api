@@ -1305,13 +1305,130 @@ async def count_tokens(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
 ):
-    """Anthropic token 计数端点（stub）。
+    """Anthropic token 计数端点。
 
-    Claude Code 可能在发送消息前调用此端点。
-    返回一个简单估算值，不做实际 token 计数。
+    Claude Code 在发送消息前调用此端点获取 token 计数。
+    后端只支持流式请求，所以我们发送流式请求并从中提取 usage。
     """
     _check_auth(authorization, x_api_key)
-    return {"input_tokens": 0}
+    cred = _cred()
+
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {"message": f"bad json: {e}", "type": "invalid_request_error"}
+            },
+        )
+
+    messages = payload.get("messages") or []
+    if not messages:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": "messages is required",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    try:
+        chat_body = anthropic_request_to_chat(payload)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": f"request conversion error: {e}",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    # 最小化实际生成：只需要 usage 统计
+    chat_body.setdefault("model", "auto")
+    chat_body["max_tokens"] = 1
+    chat_body["stream"] = True  # 后端只支持流式
+    chat_body["stream_options"] = {"include_usage": True}
+
+    if CONFIG.get("desensitize"):
+        chat_body = desensitize_body(
+            chat_body,
+            roles=("system", "developer"),
+            desensitize_harness_user=True,
+            desensitize_tools=True,
+            compact_harness=not CONFIG.get("no_compact"),
+            strip_tool_metadata=True,
+        )
+
+    headers = cred.get_headers()
+    url = f"{BACKEND}/v2/chat/completions"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async with client.stream(
+                "POST", url, headers=headers, json=chat_body
+            ) as resp:
+                if resp.status_code != 200:
+                    err = await resp.aread()
+                    _log(
+                        f"✗ count_tokens HTTP {resp.status_code}: {_truncate(err.decode('utf-8', 'replace'), 200)}"
+                    )
+                    raise HTTPException(
+                        status_code=resp.status_code,
+                        detail={
+                            "error": {
+                                "message": err.decode("utf-8", "replace")[:500],
+                                "type": "api_error",
+                                "code": resp.status_code,
+                            }
+                        },
+                    )
+
+                # 解析 SSE 流，查找 usage 信息
+                # message_start 包含初始 usage（0），message_delta 包含真实 usage
+                input_tokens = 0
+                async for line in resp.aiter_lines():
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            # message_delta 事件直接包含 usage
+                            if "usage" in chunk:
+                                usage = chunk.get("usage") or {}
+                                tokens = usage.get("prompt_tokens", 0) or usage.get(
+                                    "input_tokens", 0
+                                )
+                                if tokens > 0:
+                                    input_tokens = tokens
+                            # message_start 事件在 message 对象中包含 usage
+                            elif "message" in chunk and "usage" in chunk["message"]:
+                                usage = chunk["message"].get("usage") or {}
+                                tokens = usage.get("prompt_tokens", 0) or usage.get(
+                                    "input_tokens", 0
+                                )
+                                if tokens > 0:
+                                    input_tokens = tokens
+                        except json.JSONDecodeError:
+                            continue
+
+                return {"input_tokens": input_tokens}
+
+    except httpx.HTTPError as e:
+        _log(f"✗ count_tokens network error: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": {"message": str(e)[:500], "type": "api_error", "code": 502}
+            },
+        ) from None
 
 
 # ---------------------------------------------------------------------------
