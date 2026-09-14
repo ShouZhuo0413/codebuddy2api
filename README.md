@@ -88,20 +88,20 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> 注意：无论是启动服务，还是执行 `python3 converter.py --help`，都必须先装依赖。
+> 注意：无论是启动服务，还是执行 `python3 -m core.converter --help`，都必须先装依赖。
 
 ### 3. 启动
 
 最常用的启动方式：
 
 ```bash
-uv run converter.py --desensitize --log converter.log
+uv run python -m core.converter --desensitize --log converter.log
 ```
 
 或：
 
 ```bash
-python3 converter.py --desensitize --log converter.log
+python3 -m core.converter --desensitize --log converter.log
 ```
 
 看到监听 `http://127.0.0.1:8787` 就说明已经起来了。
@@ -126,7 +126,7 @@ curl http://127.0.0.1:8787/v1/models
 推荐启动命令：
 
 ```bash
-uv run converter.py --desensitize --log converter.log
+uv run python -m core.converter --desensitize --log converter.log
 ```
 
 把下面配置合并到 `~/.codex/config.toml`：
@@ -169,7 +169,7 @@ Claude Code 不走 OpenAI 协议，而是走 Anthropic Messages。
 推荐启动命令：
 
 ```bash
-uv run converter.py --desensitize --log converter.log
+uv run python -m core.converter --desensitize --log converter.log
 ```
 
 在 CC Switch 里配置：
@@ -214,11 +214,11 @@ uv run converter.py --desensitize --log converter.log
 ### 基本启动
 
 ```bash
-python3 converter.py
-python3 converter.py --desensitize
-python3 converter.py --desensitize --log converter.log
-python3 converter.py --api-key mysecret
-python3 converter.py --port 9000
+python3 -m core.converter
+python3 -m core.converter --desensitize
+python3 -m core.converter --desensitize --log converter.log
+python3 -m core.converter --api-key mysecret
+python3 -m core.converter --port 9000
 ```
 
 ### 命令行参数
@@ -254,7 +254,7 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 ### 推荐启动方式
 
 ```bash
-uv run converter.py --desensitize --log converter.log
+uv run python -m core.converter --desensitize --log converter.log
 ```
 
 ### 日志里能看到什么
@@ -315,24 +315,57 @@ uv run converter.py --desensitize --log converter.log
 
 ---
 
+## 管理后台（可选）
+
+除原转换器外，项目附带一个中文 Web 管理后台（`admin/`），适合服务器长期运行：
+
+- 浏览器授权添加国内 CodeBuddy / WorkBuddy 账号，无需桌面端；多账号自动轮转、冷却与积分耗尽避让
+- 凭据刷新、积分余额查询、每日自动签到（默认北京时间 09:00，可配置）
+- 客户端 API Key 创建与撤销、真实模型连接测试
+- 概览页：请求量、完成成功率、HTTP 成功率、平均耗时与最近 100 条请求
+
+本地启动（需先安装依赖并设置至少 20 位的管理密钥）：
+
+```bash
+export ADMIN_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(36))")
+export CODEBUDDY2OPENAI_KEY=sk-wb-$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+python3 -m admin.server
+```
+
+然后访问 `http://127.0.0.1:8787/admin/`。一键 Docker 部署见下文；详细说明见 [ADMIN_README.md](ADMIN_README.md)。
+
+> 管理后台为单进程设计，正式对外部署必须放在 HTTPS 反向代理之后（示例：`deploy/admin/nginx.conf.example`）。直接运行 `python3 -m core.converter` 的原有用法不受影响。
+
+---
+
 ## Docker 部署
 
 如果你更习惯用 Docker，可以直接用。
 
 前提是把宿主机登录态目录挂进去，因为容器里拿不到桌面端 auth 文件。
 
-### docker compose
+### 一键部署（推荐，含管理后台）
 
-先改 `docker-compose.yml` 里的 auth 挂载路径，再执行：
+一条命令完成密钥生成、镜像构建与启动：
 
 ```bash
-docker compose up -d --build
+bash deploy/one-click/deploy.sh
 ```
 
-### docker run
+脚本会自动生成 `ADMIN_KEY` 与客户端 Key（保存在 `deploy/one-click/.env`，仅首次显示），随后访问 `http://127.0.0.1:8787/admin/`。改端口：编辑 `deploy/one-click/.env` 里的 `PORT` 后重跑脚本。
+
+### docker compose（独立转换器）
+
+先改 `deploy/standalone/docker-compose.yml` 里的 auth 挂载路径，再执行：
 
 ```bash
-docker build -t workbuddy2api .
+docker compose -f deploy/standalone/docker-compose.yml up -d --build
+```
+
+### docker run（独立转换器）
+
+```bash
+docker build -t workbuddy2api -f deploy/standalone/Dockerfile .
 
 docker run -d --name workbuddy2api -p 8787:8787 \
   -v ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro \
@@ -354,9 +387,9 @@ docker run -d --name workbuddy2api -p 8787:8787 \
 
 当前内置默认模型列表：
 
-`glm-5.2`、`glm-5.1`、`glm-5v-turbo`、`kimi-k2.7`、`kimi-k2.6`、`kimi-k2.5`、`deepseek-v4-pro`、`deepseek-v4-flash`、`minimax-m3-pay`、`hy3-preview-agent`、`auto`
+`hy3`、`hy4-preview`、`kimi-k3`、`kimi-k2.8-preview`、`glm-5.3`、`glm-5.3-flash`、`glm-5.2`、`glm-5.1`、`glm-5v-turbo`、`kimi-k2.7`、`kimi-k2.6`、`kimi-k2.5`、`deepseek-v4-pro`、`deepseek-v4.1-flash`、`deepseek-v4-flash`、`minimax-m3-pay`、`hy3-preview-agent`、`auto`
 
-具体能不能用，取决于你的 WorkBuddy / CodeBuddy 订阅。
+> 本机装有 WorkBuddy 时优先使用其动态模型目录，上表为兜底列表。具体能不能用，取决于你的 WorkBuddy / CodeBuddy 订阅与上游状态。
 
 ---
 
@@ -364,25 +397,33 @@ docker run -d --name workbuddy2api -p 8787:8787 \
 
 ```text
 workbuddy2api/
-├── converter.py
-├── responses_adapter.py
-├── responses_projection.py
-├── anthropic_adapter.py
-├── desensitize.py
+├── core/                      # 协议转换核心
+│   ├── converter.py           # 主入口，FastAPI 服务（python3 -m core.converter）
+│   ├── responses_adapter.py   # OpenAI Responses ↔ Chat 适配
+│   ├── responses_projection.py# Codex / agent 请求投影压缩
+│   ├── anthropic_adapter.py   # Anthropic Messages ↔ Chat 适配
+│   └── desensitize.py         # 运行时文本压缩与零宽脱敏
+├── admin/                     # 中文管理后台（可选，python3 -m admin.server）
+│   ├── server.py              # 管理 API、会话与静态页面
+│   ├── pool.py                # 账号池轮转、冷却、积分与签到
+│   ├── browser_login.py       # 浏览器授权登录
+│   ├── metrics.py             # 请求统计
+│   └── static/                # 前端资源
+├── deploy/                    # 部署
+│   ├── standalone/            # 独立转换器（Dockerfile + compose）
+│   ├── admin/                 # 管理后台（Dockerfile + compose + nginx 示例）
+│   └── one-click/             # 一键式部署（deploy.sh 自动生成密钥并启动）
+├── tests/                     # 单元测试（pytest）
 ├── codex-codebuddy.example.toml
-├── test_responses_adapter.py
-├── test_anthropic_adapter.py
 ├── README.md
 └── LICENSE
 ```
 
-各文件作用：
+运行测试：
 
-- `converter.py`: 主入口，FastAPI 服务
-- `responses_adapter.py`: OpenAI Responses ↔ Chat 适配
-- `responses_projection.py`: Codex / agent 请求投影压缩
-- `anthropic_adapter.py`: Anthropic Messages ↔ Chat 适配
-- `desensitize.py`: 运行时文本压缩与零宽脱敏
+```bash
+python3 -m pytest tests/
+```
 
 ---
 
@@ -427,7 +468,7 @@ cd workbuddy2api
 
 uv venv
 uv pip install -r requirements.txt
-uv run converter.py --desensitize --log converter.log
+uv run python -m core.converter --desensitize --log converter.log
 ```
 
 Then verify:
@@ -480,11 +521,12 @@ Use `/v1/messages`:
 - `/v1/responses` already applies backend-facing projection by default
 - `--desensitize --no-compact` preserves more of the original system prompt
 - if that still gets review-blocked, `/v1/responses` will retry once in compact mode
+- an optional Chinese web admin console (`python3 -m admin.server`, see [ADMIN_README.md](ADMIN_README.md)) adds browser-based account authorization, multi-account rotation, client API keys, daily check-in and request metrics; one-command Docker setup: `bash deploy/one-click/deploy.sh`
 
 ### CLI Options
 
 ```bash
-python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [--desensitize] [--skip-check]
+python3 -m core.converter [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [--desensitize] [--skip-check]
 ```
 
 ### Disclaimer

@@ -9,7 +9,7 @@ import json
 import sys
 sys.path.insert(0, ".")
 
-from anthropic_adapter import (
+from core.anthropic_adapter import (
     anthropic_request_to_chat,
     AnthropicStreamConverter,
 )

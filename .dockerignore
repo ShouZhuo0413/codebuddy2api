@@ -1,0 +1,12 @@
+.git
+.idea
+__pycache__
+.env
+auth
+management
+backups
+wheels
+*.tar.gz
+*.log
+*.env
+preview_admin.py

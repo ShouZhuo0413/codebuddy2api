@@ -35,7 +35,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 try:
-    from desensitize import desensitize_body
+    from .desensitize import desensitize_body
 except ImportError:  # 模块缺失时降级为不脱敏
 
     def desensitize_body(
@@ -49,15 +49,15 @@ except ImportError:  # 模块缺失时降级为不脱敏
         return body
 
 
-from anthropic_adapter import (
+from .anthropic_adapter import (
     AnthropicStreamConverter,
     anthropic_request_to_chat,
 )
-from responses_adapter import (
+from .responses_adapter import (
     ResponsesStreamConverter,
     responses_request_to_chat,
 )
-from responses_projection import project_responses_chat_body
+from .responses_projection import project_responses_chat_body
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -160,6 +160,9 @@ class CredentialManager:
         if data.get("code") != 0 or not data.get("data"):
             raise RuntimeError(f"刷新 token 失败：{data.get('msg', data)}")
         new_auth = data["data"]
+        if not isinstance(new_auth, dict) or not new_auth.get("accessToken"):
+            raise RuntimeError("刷新响应缺少访问令牌")
+        new_auth["refreshToken"] = new_auth.get("refreshToken") or auth.get("refreshToken", "")
         # 继承部分字段
         new_auth["domain"] = new_auth.get("domain") or auth.get("domain")
         new_auth["lastRefreshTime"] = int(time.time() * 1000)
@@ -222,6 +225,12 @@ class CredentialManager:
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODELS = [
+    "hy3",
+    "hy4-preview",
+    "kimi-k3",
+    "kimi-k2.8-preview",
+    "glm-5.3",
+    "glm-5.3-flash",
     "glm-5.2",
     "glm-5.1",
     "glm-5v-turbo",
@@ -229,6 +238,7 @@ DEFAULT_MODELS = [
     "kimi-k2.6",
     "kimi-k2.5",
     "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
     "deepseek-v4-flash",
     "minimax-m3-pay",
     "hy3-preview-agent",
@@ -456,6 +466,15 @@ def _check_auth(authorization: str | None, x_api_key: str | None):
 
 
 def _cred() -> CredentialManager:
+    # The management deployment binds one credential to each ASGI request.
+    # Standalone converter usage keeps the original single-account behavior.
+    try:
+        from admin.pool import REQUEST_CREDENTIAL
+        selected = REQUEST_CREDENTIAL.get()
+        if selected is not None:
+            return selected
+    except ImportError:
+        pass
     if CONFIG["cred"] is None:
         raise HTTPException(
             status_code=503,
