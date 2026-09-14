@@ -1,5 +1,7 @@
 # workbuddy2api
 
+> 本 fork 新增中文管理后台：支持账号凭据导入与切换、客户端 API Key 管理、连接测试，以及新增模型目录。部署方式见 [管理后台说明](ADMIN_README.md)。原转换器启动方式仍然保留。
+
 把 **WorkBuddy / CodeBuddy（腾讯代码助手）** 的桌面端登录态，转成你本机可直接使用的 **OpenAI / Anthropic 兼容 API**。
 
 适用场景：

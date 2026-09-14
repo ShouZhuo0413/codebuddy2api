@@ -21,4 +21,16 @@ Thumbs.db
 *.token
 *.key
 secrets.*
+.env
+.env.*
+!.env.example
+!.env.admin.example
+auth/
+management/
+backups/
+wheels/
+*.info
+*.tar.gz
+management-access.txt
+.idea/
 
