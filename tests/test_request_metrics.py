@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 
-from request_metrics import MetricsMiddleware, RequestMetrics
+from admin.metrics import MetricsMiddleware, RequestMetrics
 
 
 class MetricsTests(unittest.IsolatedAsyncioTestCase):

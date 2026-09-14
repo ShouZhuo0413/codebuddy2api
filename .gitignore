@@ -28,6 +28,7 @@ secrets.*
 auth/
 management/
 backups/
+deploy/one-click/data/
 wheels/
 *.info
 *.tar.gz

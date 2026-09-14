@@ -1,0 +1,26 @@
+name: workbuddy-oneclick
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: deploy/one-click/Dockerfile
+    image: local/codebuddy2api:one-click
+    container_name: workbuddy-oneclick
+    restart: unless-stopped
+    ports:
+      # 仅监听本机回环；对外提供时请在前面加 HTTPS 反向代理
+      - "127.0.0.1:${PORT:-8787}:8787"
+    environment:
+      ADMIN_KEY: ${ADMIN_KEY:?请先运行 deploy.sh 自动生成，或参考 env.example 手动创建 .env}
+      CODEBUDDY2OPENAI_KEY: ${CODEBUDDY2OPENAI_KEY:?请先运行 deploy.sh 自动生成，或参考 env.example 手动创建 .env}
+      CODEBUDDY_AUTH_DIR: /data/auth
+      MANAGEMENT_DATA_DIR: /data/management
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/auth:/data/auth
+      - ./data/management:/data/management
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

@@ -9,12 +9,12 @@ import json
 import sys
 sys.path.insert(0, ".")
 
-from responses_adapter import (
+from core.responses_adapter import (
     responses_request_to_chat,
     ResponsesStreamConverter,
 )
-from desensitize import desensitize_body
-from responses_projection import project_responses_chat_body
+from core.desensitize import desensitize_body
+from core.responses_projection import project_responses_chat_body
 
 
 def test_simple_text_request():

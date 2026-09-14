@@ -16,14 +16,14 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
-import converter
-from browser_login import BrowserLogin
-from account_pool import AccountPool, PoolMiddleware
-from request_metrics import RequestMetrics, MetricsMiddleware
+from core import converter
+from .browser_login import BrowserLogin
+from .pool import AccountPool, PoolMiddleware
+from .metrics import RequestMetrics, MetricsMiddleware
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
-ASSETS = Path(__file__).parent / "admin_static"
+ASSETS = Path(__file__).parent / "static"
 
 
 def digest(value):

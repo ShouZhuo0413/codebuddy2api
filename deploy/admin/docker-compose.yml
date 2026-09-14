@@ -2,11 +2,11 @@ name: workbuddy-console
 services:
   app:
     build:
-      context: .
-      dockerfile: Dockerfile.admin
+      context: ../..
+      dockerfile: deploy/admin/Dockerfile
     image: local/codebuddy2api:console
     restart: unless-stopped
-    command: ["python3", "admin_server.py"]
+    command: ["python3", "-m", "admin.server"]
     ports:
       - "127.0.0.1:8787:8787"
     environment:

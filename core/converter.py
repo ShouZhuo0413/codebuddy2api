@@ -35,7 +35,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 try:
-    from desensitize import desensitize_body
+    from .desensitize import desensitize_body
 except ImportError:  # 模块缺失时降级为不脱敏
 
     def desensitize_body(
@@ -49,15 +49,15 @@ except ImportError:  # 模块缺失时降级为不脱敏
         return body
 
 
-from anthropic_adapter import (
+from .anthropic_adapter import (
     AnthropicStreamConverter,
     anthropic_request_to_chat,
 )
-from responses_adapter import (
+from .responses_adapter import (
     ResponsesStreamConverter,
     responses_request_to_chat,
 )
-from responses_projection import project_responses_chat_body
+from .responses_projection import project_responses_chat_body
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -469,7 +469,7 @@ def _cred() -> CredentialManager:
     # The management deployment binds one credential to each ASGI request.
     # Standalone converter usage keeps the original single-account behavior.
     try:
-        from account_pool import REQUEST_CREDENTIAL
+        from admin.pool import REQUEST_CREDENTIAL
         selected = REQUEST_CREDENTIAL.get()
         if selected is not None:
             return selected

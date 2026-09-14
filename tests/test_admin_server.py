@@ -6,7 +6,7 @@ from pathlib import Path
 
 import httpx
 
-import admin_server
+import admin.server as admin_server
 
 ADMIN = "admin-test-credential-long-enough"
 API = "client-existing-key"

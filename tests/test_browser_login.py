@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import httpx
 from fastapi import HTTPException
 
-from browser_login import BASE, BrowserLogin
+from admin.browser_login import BASE, BrowserLogin
 import test_admin_server as admin_tests
 from test_admin_server import credential
 

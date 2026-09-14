@@ -18,13 +18,13 @@
 
 ## 文件
 
-- `admin_server.py`：后台 API、持久化存储、客户端鉴权及转换器适配。
-- `browser_login.py`：WorkBuddy 授权状态创建、独立 cookie 会话、轮询和令牌交换。授权会话绑定管理登录，令牌不返回浏览器；超时、取消、登出后清理。
-- `account_pool.py`：请求级凭据绑定、轮转、冷却、积分查询与每日签到。`test_account_pool.py` 验证并发隔离、轮转、签到防重复、精确积分及分页。
-- `request_metrics.py`：本次进程启动以来的有界请求统计；不存储请求正文、回复或密钥。
-- `admin_static/`：无外部 CDN 依赖的中文界面。
-- `test_admin_server.py`：鉴权、CSRF、账号生命周期、密钥撤销、重启持久化、上传限制和限流测试。
-- `Dockerfile.admin`：在已部署的转换器镜像上构建管理层，不修改模型转换逻辑。
+- `admin/server.py`：后台 API、持久化存储、客户端鉴权及转换器适配。
+- `admin/browser_login.py`：WorkBuddy 授权状态创建、独立 cookie 会话、轮询和令牌交换。授权会话绑定管理登录，令牌不返回浏览器；超时、取消、登出后清理。
+- `admin/pool.py`：请求级凭据绑定、轮转、冷却、积分查询与每日签到。`tests/test_account_pool.py` 验证并发隔离、轮转、签到防重复、精确积分及分页。
+- `admin/metrics.py`：本次进程启动以来的有界请求统计；不存储请求正文、回复或密钥。
+- `admin/static/`：无外部 CDN 依赖的中文界面。
+- `tests/test_admin_server.py`：鉴权、CSRF、账号生命周期、密钥撤销、重启持久化、上传限制和限流测试。
+- `deploy/admin/Dockerfile`：在已部署的转换器镜像上构建管理层，不修改模型转换逻辑。
 
 ## 配置与运行
 
@@ -39,35 +39,35 @@
 
 生产使用一个 Uvicorn 进程。会话和账号选择缓存在进程内，不适用于直接增加多 worker。Nginx 终止 HTTPS，后端端口仅绑定服务器回环地址。管理会话重启后需重新登录。
 
-运行入口：`python3 admin_server.py`。直接运行原 `converter.py` 不加载管理层，也不读取新的密钥列表。
+运行入口：`python3 -m admin.server`。直接运行原 `python3 -m core.converter` 不加载管理层，也不读取新的密钥列表。
 
 独立新环境需先构建基础镜像：
 
 ```bash
-docker build -f Dockerfile -t local/codebuddy2api:f717db6 .
-cp .env.admin.example .env
+docker build -f deploy/standalone/Dockerfile -t local/codebuddy2api:f717db6 .
+cp deploy/admin/env.example .env
 # 编辑 .env，分别填写随机管理密钥和客户端 API Key
-docker compose -f docker-compose.admin.yml up -d --build
+docker compose -f deploy/admin/docker-compose.yml up -d --build
 ```
 
-配置 Nginx HTTPS 后再登录：管理会话使用 Secure Cookie，不支持通过普通 HTTP 登录。可参考 `deploy/nginx-console.conf.example` 配置反向代理和 `/responses` 兼容入口。该文件是 server 块内部的片段，需要自行配置域名和 TLS 证书。
+配置 Nginx HTTPS 后再登录：管理会话使用 Secure Cookie，不支持通过普通 HTTP 登录。可参考 `deploy/admin/nginx.conf.example` 配置反向代理和 `/responses` 兼容入口。该文件是 server 块内部的片段，需要自行配置域名和 TLS 证书。
 
 账号和管理数据均挂载持久化，重建容器不会丢失。不要把 `.env`、`auth/` 或 `management/` 上传到 GitHub。新环境没有凭据时，可以先登录后台再导入账号。
 
 ## 模型目录更新
 
-在原列表上补充 `hy3`、`hy4-preview`、`kimi-k3`、`glm-5.3`、`glm-5.3-flash`、`deepseek-v4.1-flash` 和 `kimi-k2.8-preview`。API 与管理后台共用 `converter.py` 中的模型列表。
+在原列表上补充 `hy3`、`hy4-preview`、`kimi-k3`、`glm-5.3`、`glm-5.3-flash`、`deepseek-v4.1-flash` 和 `kimi-k2.8-preview`。API 与管理后台共用 `core/converter.py` 中的模型列表。
 
 这些名称不保证每个账号都有调用权限。2026-09-12 的验证中，`kimi-k2.8-preview` 在上游目录可见，但两个账号调用均返回 11102（模型服务不存在）；此项只加入列表，尚未验证调用成功。其余新增模型曾完成最小调用验证，可用性随上游变化。
 
 ## 验证
 
 ```bash
-python -m unittest test_admin_server -v
-python -m unittest test_browser_login -v
-python -m unittest test_account_pool -v
-python -m unittest test_request_metrics -v
-node --check admin_static/app.js
+python -m unittest tests.test_admin_server -v
+python -m unittest tests.test_browser_login -v
+python -m unittest tests.test_account_pool -v
+python -m unittest tests.test_request_metrics -v
+node --check admin/static/app.js
 ```
 
 5 组后台测试在本机和生产镜像内均通过。浏览器验证本地登录、账号列表和 JSON 导入；公网验证登录页、管理会话、现有客户端 Key、新 Key 创建与撤销。后台通过 deepseek-v4-flash 发起真实调用，返回 HTTP 200 / OK。
@@ -96,7 +96,7 @@ node --check admin_static/app.js
 
 请求通过 ContextVar 绑定独立凭据，各账号 CredentialManager 缓存和刷新锁共享。上游 401/403 触发 5 分钟冷却，402/429 触发 30 分钟冷却。后续请求跳过冷却账号；已发送的流式请求不会重放，避免重复消费或重复工具输出。凭据准备失败时尝试另一个可用账号。没有可用账号返回 503。管理页连接测试使用手动指定的测试账号。
 
-原始 converter.py 直接启动仍采用单账号行为；账号池运行入口是 admin_server.py，要求单进程部署。
+原始转换器直接启动（`python3 -m core.converter`）仍采用单账号行为；账号池运行入口是 `admin/server.py`，要求单进程部署。
 
 ## 概览统计口径
 

@@ -9,9 +9,9 @@ from unittest.mock import Mock
 import httpx
 from fastapi import HTTPException
 
-import converter
-from admin_server import Store
-from account_pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages
+from core import converter
+from admin.server import Store
+from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages
 from test_admin_server import credential
 
 
