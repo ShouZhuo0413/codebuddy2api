@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
@@ -16,6 +17,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 import converter
+from browser_login import BrowserLogin
+from account_pool import AccountPool, PoolMiddleware
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
@@ -56,6 +59,7 @@ class Store:
         self.sessions, self.attempts = {}, {}
         self.test_lock = asyncio.Lock()
         self.test_keys = set()
+        self.managers = {}
         self.started = time.time()
         self.events = deque(maxlen=40)
         self.path = self.root / "state.json"
@@ -104,6 +108,40 @@ class Store:
     def save(self):
         write_json(self.path, self.data)
 
+    def save_browser_account(self, doc, name):
+        self.validate_credential(doc)
+        with self.lock:
+            identity = (doc["account"]["uid"], doc["account"].get("enterpriseId", ""))
+            for aid, item in self.data["accounts"].items():
+                try:
+                    old = json.loads(self.file_for(item).read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    continue
+                if (old.get("account", {}).get("uid"), old.get("account", {}).get("enterpriseId", "")) == identity:
+                    current = self.manager_for(aid, item)
+                    if current:
+                        with current._lock:
+                            write_json(self.file_for(item), doc)
+                            current._cached = None
+                    else:
+                        write_json(self.file_for(item), doc)
+                    if name:
+                        item["name"] = name
+                    self.data.get("account_status", {}).pop(aid, None)
+                    self.save()
+                    self.sync_active()
+                    return {"account_id": aid, "updated": True}
+            if len(self.data["accounts"]) >= 100:
+                raise HTTPException(400, "最多保存 100 个账号")
+            aid = secrets.token_hex(8)
+            write_json(self.auth_dir / (aid + ".info"), doc)
+            self.data["accounts"][aid] = {"file": aid + ".info", "name": name or str(doc["account"].get("nickname") or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True}
+            if self.data["active"] is None:
+                self.data["active"] = aid
+            self.save()
+            self.sync_active()
+            return {"account_id": aid, "updated": False}
+
     def file_for(self, item):
         path = self.auth_dir / item["file"]
         if path.parent.resolve() != self.auth_dir.resolve() or path.is_symlink():
@@ -113,7 +151,13 @@ class Store:
     def sync_active(self):
         aid = self.data.get("active")
         item = self.data["accounts"].get(aid)
-        converter.CONFIG["cred"] = converter.CredentialManager(self.file_for(item)) if item and item["enabled"] and self.file_for(item).exists() else None
+        converter.CONFIG["cred"] = self.manager_for(aid, item) if item and item["enabled"] and self.file_for(item).exists() else None
+
+    def manager_for(self, aid, item):
+        with self.lock:
+            if aid not in self.managers:
+                self.managers[aid] = converter.CredentialManager(self.file_for(item))
+            return self.managers[aid]
 
     def account_rows(self):
         result = []
@@ -122,7 +166,7 @@ class Store:
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 expiry = doc["auth"].get("expiresAt", 0)
-                row.update({"nickname": str(doc["account"].get("nickname") or ""), "expires_at": expiry, "expired": expiry < time.time() * 1000, "refresh_available": bool(doc["auth"].get("refreshToken")), "status": "ready"})
+                row.update({"nickname": str(doc["account"].get("nickname") or ""), "uid": str(doc["account"].get("uid") or ""), "expires_at": expiry, "expired": expiry < time.time() * 1000, "refresh_available": bool(doc["auth"].get("refreshToken")), "status": "ready"})
             except (ValueError, OSError, KeyError):
                 row.update({"status": "invalid", "expired": True, "expires_at": 0, "refresh_available": False})
             result.append(row)
@@ -190,9 +234,43 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     store = Store(root or os.environ.get("MANAGEMENT_DATA_DIR", "/data/management"), auth_dir or os.environ.get("CODEBUDDY_AUTH_DIR", "/data/auth"), initial_key if initial_key is not None else os.environ.get("CODEBUDDY2OPENAI_KEY", ""), admin_key or os.environ.get("ADMIN_KEY", ""))
     converter._check_auth = store.check_api
     converter.CONFIG.update({"desensitize": True, "no_compact": False, "log_path": None})
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    browser_login = BrowserLogin(store.save_browser_account)
+    pool = AccountPool(store)
+    @asynccontextmanager
+    async def lifespan(app):
+        async def reap():
+            while True:
+                await asyncio.sleep(30)
+                await browser_login.cleanup()
+        cleanup_task = asyncio.create_task(reap())
+        async def pool_worker():
+            while True:
+                try:
+                    await pool.tick()
+                except Exception:
+                    pass  # Per-account errors are persisted without credential data.
+                await asyncio.sleep(60)
+        pool_task = asyncio.create_task(pool_worker())
+        try:
+            yield
+        finally:
+            cleanup_task.cancel()
+            pool_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            await browser_login.close()
+            try:
+                await pool_task
+            except asyncio.CancelledError:
+                pass
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.store = store
+    app.state.browser_login = browser_login
+    app.state.pool = pool
     app.add_middleware(AdminMiddleware)
+    app.add_middleware(PoolMiddleware, pool=pool)
 
     async def payload(req):
         try:
@@ -257,18 +335,79 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     @app.post("/admin/api/logout")
     async def logout(req: Request):
         store.require_admin(req)
+        await browser_login.cancel_owner(digest(req.cookies.get(COOKIE, "")))
         with store.lock:
             store.sessions.pop(digest(req.cookies.get(COOKIE, "")), None)
         response = JSONResponse({"ok": True})
         response.delete_cookie(COOKIE, path="/admin", secure=secure_cookie, httponly=True, samesite="strict")
         return response
 
+    @app.post("/admin/api/oauth/start")
+    async def oauth_start(req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        name = clean_name(body.get("name"), None)
+        try:
+            return await browser_login.start(digest(req.cookies.get(COOKIE, "")), name)
+        except (httpx.HTTPError, ValueError, TypeError):
+            raise HTTPException(502, "授权服务连接失败，请稍后重试")
+
+    @app.post("/admin/api/oauth/{fid}/poll")
+    async def oauth_poll(fid: str, req: Request):
+        store.require_admin(req)
+        try:
+            return await browser_login.poll(fid, digest(req.cookies.get(COOKIE, "")))
+        except (httpx.HTTPError, ValueError, TypeError):
+            raise HTTPException(502, "授权状态暂时无法获取，请稍后重试")
+
+    @app.delete("/admin/api/oauth/{fid}")
+    async def oauth_cancel(fid: str, req: Request):
+        store.require_admin(req)
+        return await browser_login.cancel(fid, digest(req.cookies.get(COOKIE, "")))
+
     @app.get("/admin/api/overview")
     async def overview(req: Request):
         store.require_admin(req)
         with store.lock:
             keys = [{"id": kid, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
-            return {"accounts": store.account_rows(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+
+    @app.post("/admin/api/accounts/{aid}/actions/{action}")
+    async def account_action(aid: str, action: str, req: Request):
+        store.require_admin(req)
+        if action not in ("refresh", "status", "checkin"):
+            raise HTTPException(404)
+        return await asyncio.to_thread(pool.operate, aid, action)
+
+    @app.post("/admin/api/pool/actions/{action}")
+    async def pool_action(action: str, req: Request):
+        store.require_admin(req)
+        if action not in ("status", "checkin"):
+            raise HTTPException(404)
+        return await pool.batch(action)
+
+    @app.patch("/admin/api/pool/settings")
+    async def pool_settings(req: Request):
+        store.require_admin(req)
+        body = await payload(req)
+        import re
+        with store.lock:
+            settings = dict(store.data["pool"])
+            if "routing" in body:
+                if body["routing"] not in ("manual", "round_robin"):
+                    raise HTTPException(400, "调度方式无效")
+                settings["routing"] = body["routing"]
+            if "auto_checkin" in body:
+                if type(body["auto_checkin"]) is not bool:
+                    raise HTTPException(400, "签到开关无效")
+                settings["auto_checkin"] = body["auto_checkin"]
+            if "checkin_time" in body:
+                if not isinstance(body["checkin_time"], str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", body["checkin_time"]):
+                    raise HTTPException(400, "请选择有效的签到时间")
+                settings["checkin_time"] = body["checkin_time"]
+            store.data["pool"] = settings
+            store.save()
+        return {"ok": True, "pool": settings}
 
     @app.post("/admin/api/accounts")
     async def add_account(req: Request):

@@ -160,6 +160,9 @@ class CredentialManager:
         if data.get("code") != 0 or not data.get("data"):
             raise RuntimeError(f"刷新 token 失败：{data.get('msg', data)}")
         new_auth = data["data"]
+        if not isinstance(new_auth, dict) or not new_auth.get("accessToken"):
+            raise RuntimeError("刷新响应缺少访问令牌")
+        new_auth["refreshToken"] = new_auth.get("refreshToken") or auth.get("refreshToken", "")
         # 继承部分字段
         new_auth["domain"] = new_auth.get("domain") or auth.get("domain")
         new_auth["lastRefreshTime"] = int(time.time() * 1000)
@@ -463,6 +466,15 @@ def _check_auth(authorization: str | None, x_api_key: str | None):
 
 
 def _cred() -> CredentialManager:
+    # The management deployment binds one credential to each ASGI request.
+    # Standalone converter usage keeps the original single-account behavior.
+    try:
+        from account_pool import REQUEST_CREDENTIAL
+        selected = REQUEST_CREDENTIAL.get()
+        if selected is not None:
+            return selected
+    except ImportError:
+        pass
     if CONFIG["cred"] is None:
         raise HTTPException(
             status_code=503,

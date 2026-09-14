@@ -3,5 +3,7 @@ FROM ${BASE_IMAGE}
 WORKDIR /app
 COPY converter.py ./
 COPY admin_server.py ./
+COPY browser_login.py ./
+COPY account_pool.py ./
 COPY admin_static ./admin_static
 CMD ["python3", "admin_server.py"]
