@@ -4,6 +4,7 @@
 
 ## 功能
 
+- 默认概览页：可用账号、已知总积分、完成请求数、完成成功率、HTTP 成功率、失败/进行中、平均耗时及最近 100 条请求。
 - 导入桌面端 `.info` / JSON 凭据，设置备注，启用、停用、删除账号。
 - 浏览器授权登录国内 CodeBuddy / WorkBuddy，无需桌面端。生成官方登录链接，在浏览器完成授权后自动获取并保存账号；同一账号再次登录更新原凭据。
 - 保存多个账号，默认轮流分配新请求；可切换到手动指定模式。暂停、冷却和最近确认积分耗尽的账号不参与轮转。
@@ -20,6 +21,7 @@
 - `admin_server.py`：后台 API、持久化存储、客户端鉴权及转换器适配。
 - `browser_login.py`：WorkBuddy 授权状态创建、独立 cookie 会话、轮询和令牌交换。授权会话绑定管理登录，令牌不返回浏览器；超时、取消、登出后清理。
 - `account_pool.py`：请求级凭据绑定、轮转、冷却、积分查询与每日签到。`test_account_pool.py` 验证并发隔离、轮转、签到防重复、精确积分及分页。
+- `request_metrics.py`：本次进程启动以来的有界请求统计；不存储请求正文、回复或密钥。
 - `admin_static/`：无外部 CDN 依赖的中文界面。
 - `test_admin_server.py`：鉴权、CSRF、账号生命周期、密钥撤销、重启持久化、上传限制和限流测试。
 - `Dockerfile.admin`：在已部署的转换器镜像上构建管理层，不修改模型转换逻辑。
@@ -64,6 +66,7 @@ docker compose -f docker-compose.admin.yml up -d --build
 python -m unittest test_admin_server -v
 python -m unittest test_browser_login -v
 python -m unittest test_account_pool -v
+python -m unittest test_request_metrics -v
 node --check admin_static/app.js
 ```
 
@@ -94,3 +97,11 @@ node --check admin_static/app.js
 请求通过 ContextVar 绑定独立凭据，各账号 CredentialManager 缓存和刷新锁共享。上游 401/403 触发 5 分钟冷却，402/429 触发 30 分钟冷却。后续请求跳过冷却账号；已发送的流式请求不会重放，避免重复消费或重复工具输出。凭据准备失败时尝试另一个可用账号。没有可用账号返回 503。管理页连接测试使用手动指定的测试账号。
 
 原始 converter.py 直接启动仍采用单账号行为；账号池运行入口是 admin_server.py，要求单进程部署。
+
+## 概览统计口径
+
+统计 POST `/v1/chat/completions`、`/v1/responses` 和 `/v1/messages`，包括后台模型测试，来源分别标记为 API 和后台测试。模型列表、计数接口、积分查询和其它管理操作不计入。`/responses` 经 Nginx 内部重写后归入 `/v1/responses`。
+
+对话请求数是已结束请求总数，进行中的请求单独显示；未鉴权请求及无可用账号导致的失败也会计数。HTTP 成功率为 2xx 响应占比；完成成功率另外排除流式 error / failed / incomplete 事件、断开、异常和缺少结束标记的流。平均耗时为已结束请求的总耗时均值，包含失败请求。完成成功率不代表语义质量或回复正确率。
+
+统计保存在内存中，重启清零，只保留最近 100 条元数据，不回填升级前记录。页面标明统计起始时间，每 30 秒刷新。

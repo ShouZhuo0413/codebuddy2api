@@ -1,8 +1,9 @@
 "use strict";
 const $ = id => document.getElementById(id);
-let csrf = "", overview = null, pendingConfirm = null, page = "accounts", busy = false;
+let csrf = "", overview = null, pendingConfirm = null, page = "dashboard", busy = false;
 let accountMode = "browser", oauthFlow = null, oauthTimer = null, oauthGeneration = 0;
 const labels = {
+  dashboard: ["让每个账号，各尽其用", "WORKBUDDY WORKSPACE", "在这里查看服务运行、账号积分和请求表现。"],
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
   test: ["连接测试", "CONNECTION LAB", "从当前账号发起请求，确认模型能否正常响应。"],
@@ -27,19 +28,20 @@ async function api(path, options = {}) {
   return data;
 }
 function goPage(next) {
-  if (!(next in labels)) next = "accounts";
+  if (!(next in labels)) next = "dashboard";
   page = next;
   document.querySelectorAll(".page-panel").forEach(el => el.hidden = el.id !== "page-" + next);
   document.querySelectorAll("[data-page]").forEach(el => { el.classList.toggle("selected", el.dataset.page === next); el.setAttribute("aria-current", el.dataset.page === next ? "page" : "false"); });
   const [title, kicker, desc] = labels[next];
   $("page-title").replaceChildren(document.createTextNode(title));
   const dot = document.createElement("span"); dot.className = "title-dot"; dot.textContent = "."; $("page-title").append(dot);
-  $("breadcrumb").textContent = title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
+  $("breadcrumb").textContent = next === "dashboard" ? "概览" : title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
   history.replaceState(null, "", "#" + next);
 }
 function render() {
   const {accounts, keys, models, uptime, events} = overview;
   const active = accounts.find(a => a.active && a.enabled);
+  renderDashboard();
   $("account-count").textContent = accounts.length; $("account-badge").textContent = accounts.length;
   const rotating = overview.pool?.routing === "round_robin";
   $("active-name").textContent = rotating ? "账号池轮转" : active?.name || "未选择账号";
@@ -62,6 +64,31 @@ function render() {
   $("test-submit").disabled = !active || busy;
   $("test-history").innerHTML = events.length ? events.map(e => `<div class="history-row"><span class="mono muted">${esc(stamp(e.time * 1000))}</span><strong>${esc(e.model)}</strong><span class="pill ${e.ok ? "green" : "red"}">${e.ok ? "成功" : "失败"}</span><span class="mono">${e.seconds}s</span></div>`).join("") : '<p class="history-empty">暂无测试记录，发送第一条测试消息。</p>';
 }
+function renderDashboard() {
+  const {accounts, metrics:m = {}, pool} = overview;
+  const fmt = value => Number(value).toLocaleString("zh-CN",{maximumFractionDigits:2});
+  const rate = value => value === null || value === undefined ? "—" : value.toFixed(1) + "%";
+  $("dash-available").textContent = accounts.filter(a=>a.pool_state === "available").length + " / " + accounts.length;
+  const known = accounts.filter(a=>typeof a.remaining === "number");
+  $("dash-credits").textContent = known.length ? fmt(known.reduce((s,a)=>s+a.remaining,0)) : "—";
+  $("dash-credit-note").textContent = known.length < accounts.length ? `已查询 ${known.length}/${accounts.length} 个账号，余额可能不完整` : accounts.some(a=>a.credits_stale) ? "包含待刷新余额，以最近一次查询为准" : "以最近一次上游查询为准";
+  $("dash-requests").textContent = fmt(m.completed || 0);
+  $("dash-request-note").textContent = `API ${m.api_count || 0} · 后台测试 ${m.test_count || 0}`;
+  $("dash-success").textContent = rate(m.success_rate); $("dash-http").textContent = rate(m.http_success_rate);
+  $("dash-failed").textContent = m.failed || 0; $("dash-inflight").textContent = m.in_flight || 0;
+  $("dash-latency").textContent = m.avg_duration_ms === null || m.avg_duration_ms === undefined ? "—" : fmt(m.avg_duration_ms) + " ms";
+  $("dash-since").textContent = "统计开始于 " + stamp((m.started_at || 0)*1000);
+  $("dash-routing").textContent = pool?.routing === "round_robin" ? "轮流分配请求，自动跳过不可用账号" : "手动指定账号模式";
+  const states={available:"可用",paused:"已暂停",cooling:"冷却中",exhausted:"积分耗尽",invalid:"凭据异常"};
+  $("dash-account-list").innerHTML = accounts.slice(0,8).map(a=>`<div class="dashboard-account"><span class="account-icon">${esc(a.name.slice(0,1))}</span><div><strong>${esc(a.name)}</strong><small class="cell-note">${esc(a.uid || a.nickname)}</small></div><div class="dashboard-account-credit"><strong>${a.remaining === null || a.remaining === undefined ? "待查询" : fmt(a.remaining)}</strong><small class="cell-note">积分</small></div><span class="pill ${a.pool_state === 'available' ? 'green' : 'amber'}">${states[a.pool_state] || '待查询'}</span></div>`).join("") || '<p class="history-empty">尚未添加账号，点击“添加账号”开始。</p>';
+  if(accounts.length > 8) $("dash-account-list").insertAdjacentHTML("beforeend",'<p class="muted">更多账号请前往账号池查看。</p>');
+  const outcomes={success:"完成",stream_error:"流式错误",interrupted:"未完整结束",http_error:"请求失败"};
+  $("dash-recent-body").innerHTML=(m.recent || []).map(r=>`<tr><td class="mono muted">${esc(stamp(r.time*1000))}</td><td>${r.source === 'test' ? '后台测试' : 'API'}<small class="cell-note mono">${esc(r.path)}</small></td><td><span class="pill ${r.ok ? 'green' : 'red'}">${r.status ?? '—'}</span><small class="cell-note">${outcomes[r.outcome] || '请求失败'}</small></td><td class="align-right mono">${fmt(r.duration_ms)} ms</td></tr>`).join("") || '<tr><td colspan="4" class="history-empty">尚无请求记录。发起 API 调用或后台测试后，这里会自动更新。</td></tr>';
+}
+document.querySelectorAll("[data-dashboard-page]").forEach(b=>b.addEventListener("click",()=>goPage(b.dataset.dashboardPage)));
+$("dash-add").addEventListener("click",()=>openAccount());
+$("dash-base").textContent=location.origin+"/v1";
+$("dash-copy").addEventListener("click",()=>copy(location.origin+"/v1"));
 function renderAccounts() {
   const query = $("account-search").value.toLowerCase(), filter = $("account-filter").value;
   const rows = overview.accounts.filter(a => (!query || [a.name,a.nickname,a.uid].join(" ").toLowerCase().includes(query)) && (filter === "all" || a.pool_state === filter));

@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 import converter
 from browser_login import BrowserLogin
 from account_pool import AccountPool, PoolMiddleware
+from request_metrics import RequestMetrics, MetricsMiddleware
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
@@ -236,6 +237,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     converter.CONFIG.update({"desensitize": True, "no_compact": False, "log_path": None})
     browser_login = BrowserLogin(store.save_browser_account)
     pool = AccountPool(store)
+    metrics = RequestMetrics()
     @asynccontextmanager
     async def lifespan(app):
         async def reap():
@@ -269,8 +271,10 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     app.state.store = store
     app.state.browser_login = browser_login
     app.state.pool = pool
+    app.state.metrics = metrics
     app.add_middleware(AdminMiddleware)
     app.add_middleware(PoolMiddleware, pool=pool)
+    app.add_middleware(MetricsMiddleware, metrics=metrics)
 
     async def payload(req):
         try:
@@ -370,7 +374,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         with store.lock:
             keys = [{"id": kid, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
 
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
     async def account_action(aid: str, action: str, req: Request):
@@ -526,7 +530,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                 temp_key = secrets.token_urlsafe(48)
                 store.test_keys.add(digest(temp_key))
             try:
-                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=converter.app), base_url="http://internal") as client:
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=MetricsMiddleware(converter.app, metrics, source="test")), base_url="http://internal") as client:
                     result = await asyncio.wait_for(client.post("/v1/chat/completions", headers={"Authorization": "Bearer " + temp_key}, json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "stream": False}), timeout=90)
                 data = result.json()
                 answer = data.get("choices", [{}])[0].get("message", {}).get("content", "") if result.status_code == 200 else ""
