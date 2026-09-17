@@ -25,4 +25,34 @@
 
 更新后重启 Python 服务；Docker 部署沿用原 Compose 参数执行 `docker compose up -d --build`。保留现有账号数据及环境配置。
 
-本次未新增 previous_response_id 历史存储、内置工具、自定义工具协议或图片转换支持。README 中旧的默认 Responses 投影描述以本说明为准。
+本次未新增 previous_response_id 历史存储、内置工具或自定义工具协议。README 中旧的默认 Responses 投影描述以本说明为准。
+
+## 系统身份过滤
+
+在 Chat、Responses、Messages 及 Messages token 计数入口，转换为 Chat 格式后过滤 system/developer 中已识别的客户端或模型身份声明。删除身份语句，保留同条消息的其他指令；仅含身份的系统消息会移除。固定客户端标题去掉品牌，主分支模板保留分支值。
+
+此过滤器不修改 user、assistant、tool 消息和工具 schema。旧脱敏逻辑的 harness user 处理也已关闭。默认 Responses 保留模式下不裁剪用户历史；显式启用旧 CODEBUDDY_LOSSY_PROJECTION 仍可能截断消息，若需保留全文不要开启该选项。
+
+匹配基于明确规则，不能保证识别所有语言和任意写法，也不能保证上游安全策略放行。验证包含三种接口的角色隔离、用户模板原样保留和常规指令保留；未进行真实上游调用。
+
+
+## 图片历史格式修复
+
+上游 11101 / unsupported content type: input_image 对应 Responses 图片块没有转换为 Chat 格式。
+现统一转换普通消息和 function_call_output 的内容：input_image → image_url，input_text/output_text → text。
+保留 URL、base64 data URL、detail、图文顺序、tool_call_id 及完整历史。纯文字内容继续输出字符串。
+不删除用户图片，不修改工具参数或图片字节。仅 file_id 的图片、缺少 URL 的图片及其他未支持的内容块明确返回 400，避免静默丢失内容。
+
+91 项本地测试通过，包括 600 条文字历史加图片消息/工具结果的流式和非流式请求。模拟上游验证协议转换，未验证具体模型是否支持视觉或工具消息中的图片，也不扩大模型上下文窗口。
+更新包 workbuddy2api-image-history-fix.zip 同时包含此前的系统身份过滤，覆盖项目根目录后重启；Docker 需重新构建。包内不包含 admin/server.py，保留服务器现有日志配置；不包含账号、密钥或 data。
+
+
+## Anthropic Messages 图片历史修复
+
+/v1/messages 原先忽略 user 的 image 块，tool_result 数组也只提取文字，造成图片静默丢失。
+现转换 source.type=url/base64 为 Chat image_url，保留图文顺序、URL 和 base64 数据。仅图片的用户消息也会保留。
+同一 user 消息含多个 tool_result 和普通图文时，先发出全部工具结果，再发用户图文，保持 Chat 工具调用配对顺序。
+不支持的图片来源和内容块返回请求转换错误，不再静默删除。/v1/messages/count_tokens 共用转换逻辑。
+99 项测试通过，包含 600 条历史的三种接口路径及原有 Responses 测试；未调用真实上游，图片是否可被模型识别仍需联调。
+
+累计更新包 workbuddy2api-messages-responses-image-fix.zip 包含系统身份过滤、Responses 图片修复和本次 Messages 修复，覆盖原项目根目录后重启。未包含账户数据、密钥、部署配置或 admin/server.py。

@@ -58,6 +58,7 @@ from .responses_adapter import (
     responses_request_to_chat,
 )
 from .responses_projection import project_responses_chat_body
+from .system_identity import filter_system_identity
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -569,13 +570,15 @@ async def chat_completions(
             for m in body["messages"]
         ]
 
+    body = filter_system_identity(body)
+
     # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
     # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
     if CONFIG.get("desensitize"):
         body = desensitize_body(
             body,
             roles=("system", "developer"),
-            desensitize_harness_user=True,
+            desensitize_harness_user=False,
             desensitize_tools=True,
             compact_harness=not CONFIG.get("no_compact"),
             strip_tool_metadata=True,
@@ -901,7 +904,7 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
     return desensitize_body(
         body,
         roles=("system", "developer"),
-        desensitize_harness_user=True,
+        desensitize_harness_user=False,
         desensitize_tools=True,
         compact_harness=(force_compact or not CONFIG.get("no_compact")),
         strip_tool_metadata=True,
@@ -989,6 +992,7 @@ async def create_response(
             },
         )
 
+    chat_body = filter_system_identity(chat_body)
     chat_body, projection_stats = project_responses_chat_body(
         chat_body, preserve=os.environ.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
     )
@@ -1179,11 +1183,12 @@ async def create_message(
     if "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
+    chat_body = filter_system_identity(chat_body)
     if CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,
             roles=("system", "developer"),
-            desensitize_harness_user=True,
+            desensitize_harness_user=False,
             desensitize_tools=True,
             compact_harness=not CONFIG.get("no_compact"),
             strip_tool_metadata=True,
@@ -1372,11 +1377,12 @@ async def count_tokens(
     chat_body["stream"] = True  # 后端只支持流式
     chat_body["stream_options"] = {"include_usage": True}
 
+    chat_body = filter_system_identity(chat_body)
     if CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,
             roles=("system", "developer"),
-            desensitize_harness_user=True,
+            desensitize_harness_user=False,
             desensitize_tools=True,
             compact_harness=not CONFIG.get("no_compact"),
             strip_tool_metadata=True,

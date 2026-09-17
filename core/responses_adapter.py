@@ -96,7 +96,7 @@ def _convert_input_items(items: list) -> list[dict]:
     """
     messages: list[dict] = []
     # 临时缓存：合并相邻的 assistant message 和 function_call
-    pending_assistant_content: str | None = None
+    pending_assistant_content: str | list | None = None
     pending_tool_calls: list[dict] = []
 
     def _flush_assistant():
@@ -137,7 +137,7 @@ def _convert_input_items(items: list) -> list[dict]:
         if item_type == "message" and role == "assistant":
             _flush_assistant()
             content_parts = item.get("content", [])
-            text = _extract_output_text(content_parts) if isinstance(content_parts, list) else str(content_parts)
+            text = _extract_content(content_parts)
             pending_assistant_content = text
             continue
 
@@ -168,7 +168,7 @@ def _convert_input_items(items: list) -> list[dict]:
             messages.append({
                 "role": "tool",
                 "tool_call_id": item.get("call_id", ""),
-                "content": item.get("output", ""),
+                "content": _extract_content(item.get("output", "")),
             })
             continue
 
@@ -182,21 +182,41 @@ def _convert_input_items(items: list) -> list[dict]:
     return messages
 
 
-def _extract_content(content) -> str:
-    """提取 content（可能是 str / list[{type,text}]）。"""
+def _extract_content(content) -> str | list:
+    """Convert Responses content blocks without dropping images or text order."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
+        has_image = False
         for p in content:
             if isinstance(p, dict):
-                if p.get("type") in ("input_text", "text"):
-                    parts.append(p.get("text", ""))
-                elif p.get("type") == "output_text":
-                    parts.append(p.get("text", ""))
+                kind = p.get("type")
+                if kind in ("input_text", "text", "output_text"):
+                    parts.append({"type": "text", "text": p.get("text", "")})
+                elif kind in ("input_image", "image_url"):
+                    value = p.get("image_url")
+                    if isinstance(value, str):
+                        image = {"url": value}
+                    elif isinstance(value, dict):
+                        image = dict(value)
+                    else:
+                        raise ValueError("Image content requires image_url (URL or data URL); file_id images are not supported.")
+                    if not isinstance(image.get("url"), str) or not image["url"].strip():
+                        raise ValueError("Image content requires a non-empty image_url.")
+                    if "detail" in p:
+                        image["detail"] = p["detail"]
+                    parts.append({"type": "image_url", "image_url": image})
+                    has_image = True
+                else:
+                    raise ValueError(f"Unsupported Responses content block: {kind!r}")
             elif isinstance(p, str):
-                parts.append(p)
-        return "".join(parts) or str(content)
+                parts.append({"type": "text", "text": p})
+            else:
+                raise ValueError("Responses content blocks must be text or objects.")
+        return parts if has_image else "".join(p["text"] for p in parts)
+    if content is None:
+        return ""
     return str(content)
 
 

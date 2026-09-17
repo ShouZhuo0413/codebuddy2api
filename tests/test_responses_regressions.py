@@ -115,7 +115,7 @@ def test_endpoint_preserves_prompt_schema_and_cache(monkeypatch, stream):
     real_client = httpx.AsyncClient
     captured = []
     schema = {'type': 'object', '$defs': {'s': {'type': 'string'}}, 'properties': {'cmd': {'$ref': '#/$defs/s'}}}
-    instruction = 'You are a coding agent running in the Codex CLI. ' * 300
+    instruction = 'Keep repository conventions and preserve user data. ' * 300
 
     def upstream(request):
         captured.append(json.loads(request.content))
