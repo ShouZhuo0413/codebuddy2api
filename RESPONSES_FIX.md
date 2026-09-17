@@ -35,3 +35,10 @@ HTTP 200 不代表上游生成成功：上游可能返回 JSON 错误而非 SSE�
 
 新增长请求的模拟上游测试，覆盖 JSON 错误、JSON 正文、空流、仅推理及预算耗尽的流式/非流式路径；共 80 项测试通过。
 这些修复解决错误被吞掉及 JSON 正文被丢弃的问题，不提高上游上下文限制。真实线上空响应的具体原因仍需结合上游错误确认。
+
+## 进一步检查
+
+- SSE 中 code/msg 形式的上游拒绝现在保留原始错误原因；无效 JSON 或非对象 chunk 返回明确失败，不再静默丢弃或抛出未处理异常。
+- 传输结束时检查 [DONE] 或 finish_reason；缺少结束标记的部分输出返回 upstream_stream_interrupted，避免误报完整成功。
+- previous_response_id、conversation、compaction 和 item_reference 尚无对应历史存储/解密支持，现明确拒绝，避免丢失历史后继续请求。客户端应发送显式消息和工具结果。
+- 标准 reasoning.effort 转换为上游 reasoning_effort，避免客户端推理预算偏好被忽略。

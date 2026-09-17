@@ -1051,6 +1051,7 @@ async def create_response(
         else:
             for line in response_text.splitlines():
                 converter.feed_line(line)
+            converter.validate_stream_end()
         chat_body = final_body
     except HTTPException:
         raise
@@ -1108,6 +1109,9 @@ async def _stream_responses(
                         events = converter.feed_line(line)
                         if events:
                             yield events.encode("utf-8")
+                    end_error = converter.validate_stream_end()
+                    if end_error:
+                        yield end_error.encode("utf-8")
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield converter.error(str(e)[:500], 502).encode("utf-8")

@@ -36,6 +36,8 @@ def responses_request_to_chat(body: dict) -> dict:
       max_output_tokens → max_tokens
       tools 格式微调（Responses 用 name，Chat 用 function.name）
     """
+    if body.get("previous_response_id") or body.get("conversation"):
+        raise ValueError("Server-side conversation history is not supported; send the complete input history instead of previous_response_id/conversation.")
     messages: list[dict] = []
 
     # instructions → system message
@@ -75,6 +77,9 @@ def responses_request_to_chat(body: dict) -> dict:
                 "response_format", "reasoning_effort"):
         if key in body:
             chat[key] = body[key]
+    reasoning = body.get("reasoning") or {}
+    if isinstance(reasoning, dict) and "effort" in reasoning:
+        chat["reasoning_effort"] = reasoning["effort"]
 
     # max_output_tokens → max_tokens
     if "max_output_tokens" in body:
@@ -115,6 +120,8 @@ def _convert_input_items(items: list) -> list[dict]:
             continue
 
         item_type = item.get("type")
+        if item_type in ("compaction", "item_reference"):
+            raise ValueError(f"Unsupported input item {item_type}; send explicit conversation messages and tool outputs.")
         role = item.get("role", "")
 
         # 简单消息 {"role": "user", "content": "..."}
@@ -278,6 +285,7 @@ class ResponsesStreamConverter:
         self._error = None
         self._finished = False
         self._saw_reasoning = False
+        self._saw_done = False
 
     # ---- 公开接口 ----
 
@@ -288,12 +296,20 @@ class ResponsesStreamConverter:
             return ""
         data = line[5:].strip()
         if data == "[DONE]":
+            self._saw_done = True
             return ""
         try:
             chunk = json.loads(data)
         except json.JSONDecodeError:
-            return ""
+            return self.error("Upstream sent invalid SSE JSON.", "invalid_upstream_response")
         return self._process_chunk(chunk)
+
+    def validate_stream_end(self):
+        """Called by the transport at EOF, before completing a streamed response."""
+        if not self._error and not self._saw_done and not self._finish_reason:
+            return self.error("Upstream stream ended before a completion marker; the answer may be truncated.",
+                              "upstream_stream_interrupted")
+        return ""
 
     def finish(self) -> str:
         """流结束后，发出收尾事件（done + completed）。"""
@@ -376,6 +392,10 @@ class ResponsesStreamConverter:
         events: list[str] = []
         if self._error or self._finished:
             return ""
+        if not isinstance(chunk, dict):
+            return self.error("Upstream sent a non-object completion chunk.", "invalid_upstream_response")
+        if chunk.get("code") not in (None, 0, "0", 200, "200") and "choices" not in chunk:
+            return self.error(str(chunk.get("message") or chunk.get("msg") or "Upstream rejected the request.")[:500], chunk["code"])
         if chunk.get("error"):
             error = chunk["error"]
             if isinstance(error, dict):

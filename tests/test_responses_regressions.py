@@ -207,3 +207,49 @@ def test_long_context_empty_response_paths(monkeypatch, stream, case):
                 assert response.status_code == 502
         assert 'internal reasoning' not in response.text
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('line,code', [
+    ('data: {"code":11128,"msg":"request rejected"}', '11128'),
+    ('data: {"code":"context_length_exceeded","message":"context too long"}', 'context_length_exceeded'),
+    ('data: null', 'invalid_upstream_response'),
+    ('data: []', 'invalid_upstream_response'),
+    ('data: {broken', 'invalid_upstream_response'),
+])
+def test_sse_errors_preserve_cause_without_crashing(line, code):
+    conv = ResponsesStreamConverter()
+    result = events(conv.feed_line(line))[-1]
+    assert result['type'] == 'response.failed'
+    assert result['response']['error']['code'] == code
+    assert conv.finish() == ''
+
+
+@pytest.mark.parametrize('ending', ['eof', 'done', 'finish_reason'])
+def test_partial_output_requires_upstream_completion_marker(ending):
+    conv = ResponsesStreamConverter()
+    feed(conv, {'choices': [{'delta': {'content': 'partial answer'}}]})
+    if ending == 'done':
+        conv.feed_line('data: [DONE]')
+    elif ending == 'finish_reason':
+        feed(conv, {'choices': [{'delta': {}, 'finish_reason': 'stop'}]})
+    result = events(conv.validate_stream_end() + conv.finish())[-1]
+    assert result['type'] == ('response.failed' if ending == 'eof' else 'response.completed')
+    if ending == 'eof':
+        assert result['response']['error']['code'] == 'upstream_stream_interrupted'
+
+
+@pytest.mark.parametrize('extra', [
+    {'previous_response_id': 'resp_old'},
+    {'conversation': 'conv_old'},
+    {'input': [{'type': 'compaction', 'encrypted_content': 'opaque'}]},
+    {'input': [{'type': 'item_reference', 'id': 'msg_old'}]},
+])
+def test_unsupported_history_cannot_silently_disappear(extra):
+    with pytest.raises(ValueError):
+        responses_request_to_chat({'input': 'continue', **extra})
+
+
+def test_standard_reasoning_effort_reaches_upstream():
+    body = responses_request_to_chat({'input': 'hi', 'reasoning': {'effort': 'low'}, 'max_output_tokens': 4096})
+    assert body['reasoning_effort'] == 'low'
+    assert body['max_tokens'] == 4096
