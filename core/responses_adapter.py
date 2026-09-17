@@ -277,6 +277,7 @@ class ResponsesStreamConverter:
         self._msg_output_index = None
         self._error = None
         self._finished = False
+        self._saw_reasoning = False
 
     # ---- 公开接口 ----
 
@@ -298,6 +299,9 @@ class ResponsesStreamConverter:
         """流结束后，发出收尾事件（done + completed）。"""
         if self._finished or self._error:
             return ""
+        self._validate_output()
+        if self._error:
+            return self._evt("response.failed", {"response": self._response_obj("failed")})
         self._finished = True
         events: list[str] = []
         response = self._response_obj("completed")
@@ -338,7 +342,33 @@ class ResponsesStreamConverter:
 
     def get_nonstream_response(self) -> dict:
         """流结束后获取完整的非流式 Response 对象。"""
+        self._validate_output()
         return self._response_obj("completed")
+
+    def _validate_output(self):
+        if self._error or self._content or self._tool_calls:
+            return
+        if self._finish_reason in ("length", "content_filter", "content-filter"):
+            return
+        message = (
+            "Upstream returned reasoning without an answer or tool call. Check the model output token budget."
+            if self._saw_reasoning else
+            "Upstream ended without an answer or tool call. Check upstream context limits and response logs."
+        )
+        self._error = {"type": "upstream_error", "code": "empty_upstream_response", "message": message}
+
+    def feed_json(self, raw: str) -> str:
+        """Some upstream failures and completions arrive as JSON despite stream=true."""
+        try:
+            chunk = json.loads(raw)
+        except (ValueError, TypeError):
+            return self.error("Upstream returned an invalid JSON response.", "invalid_upstream_response")
+        if not isinstance(chunk, dict):
+            return self.error("Upstream returned an unexpected JSON response.", "invalid_upstream_response")
+        if "choices" not in chunk and not chunk.get("error"):
+            return self.error(str(chunk.get("message") or chunk.get("msg") or "Upstream returned no completion.")[:500],
+                              chunk.get("code", "invalid_upstream_response"))
+        return self._process_chunk(chunk)
 
     # ---- 内部 ----
 
@@ -374,7 +404,9 @@ class ResponsesStreamConverter:
                     self._usage[key] = value
 
         for choice in chunk.get("choices") or []:
-            delta = choice.get("delta") or {}
+            delta = choice.get("delta") or choice.get("message") or {}
+            if delta.get("reasoning_content") or delta.get("reasoning"):
+                self._saw_reasoning = True
             finish = choice.get("finish_reason")
 
             # ---- content delta ----
@@ -402,8 +434,8 @@ class ResponsesStreamConverter:
                 }))
 
             # ---- tool_calls delta ----
-            for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", 0)
+            for fallback_index, tc in enumerate(delta.get("tool_calls") or []):
+                idx = tc.get("index", fallback_index)
                 if idx not in self._tool_calls:
                     oi = self._next_output_index
                     self._next_output_index += 1

@@ -26,3 +26,12 @@
 更新后重启 Python 服务；Docker 部署沿用原 Compose 参数执行 `docker compose up -d --build`。保留现有账号数据及环境配置。
 
 本次未新增 previous_response_id 历史存储、内置工具、自定义工具协议或图片转换支持。README 中旧的默认 Responses 投影描述以本说明为准。
+
+## 长上下文空响应诊断
+
+HTTP 200 不代表上游生成成功：上游可能返回 JSON 错误而非 SSE，或只输出推理内容，没有正文或工具调用。
+现在支持读取 JSON completion/error，保留上游错误 code/message；无正文或工具调用且没有明确中止原因时返回 empty_upstream_response，避免误报为空成功。
+仅推理且 finish_reason=length 时仍返回 incomplete/max_output_tokens，提示检查输出预算。内部推理不会作为正文返回。
+
+新增长请求的模拟上游测试，覆盖 JSON 错误、JSON 正文、空流、仅推理及预算耗尽的流式/非流式路径；共 80 项测试通过。
+这些修复解决错误被吞掉及 JSON 正文被丢弃的问题，不提高上游上下文限制。真实线上空响应的具体原因仍需结合上游错误确认。

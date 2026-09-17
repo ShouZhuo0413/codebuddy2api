@@ -168,3 +168,42 @@ def test_stream_transport_errors_are_failed(monkeypatch, mode):
         assert [e['type'] for e in parsed] == ['response.failed']
         assert parsed[0]['response']['error']['code'] == ('429' if mode == 'http' else '502')
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('case', ['empty', 'reasoning', 'json_error', 'json_completion', 'length'])
+def test_long_context_empty_response_paths(monkeypatch, stream, case):
+    real_client = httpx.AsyncClient
+    def upstream(request):
+        if case == 'json_error':
+            return httpx.Response(200, json={'error': {'code': 'context_length_exceeded', 'message': 'Context too long'}})
+        if case == 'json_completion':
+            return httpx.Response(200, json={'choices': [{'message': {'content': 'answer'}, 'finish_reason': 'stop'}],
+                                           'usage': {'prompt_tokens': 100, 'prompt_cache_hit_tokens': 80}})
+        if case == 'empty':
+            return httpx.Response(200, content=b'data: [DONE]\n\n')
+        return httpx.Response(200, content=('data: ' + json.dumps({'choices': [
+            {'delta': {'reasoning_content': 'internal reasoning'}, 'finish_reason': 'length' if case == 'length' else 'stop'}
+        ]}) + '\n\ndata: [DONE]\n\n').encode())
+    monkeypatch.setattr(converter.httpx, 'AsyncClient', lambda **kw: real_client(transport=httpx.MockTransport(upstream), **kw))
+    monkeypatch.setattr(converter, '_check_auth', lambda *a: None)
+    monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}})())
+    monkeypatch.setattr(converter, '_log', lambda *a: None)
+    async def run():
+        async with real_client(transport=httpx.ASGITransport(app=converter.app), base_url='http://test') as client:
+            response = await client.post('/v1/responses', json={'input': 'long context ' * 20000, 'stream': stream})
+        result = events(response.text)[-1]['response'] if stream else response.json()
+        if case == 'json_completion':
+            assert result['status'] == 'completed'
+            assert result['output'][0]['content'][0]['text'] == 'answer'
+            assert result['usage']['input_tokens_details']['cached_tokens'] == 80
+        elif case == 'length':
+            assert result['status'] == 'incomplete'
+            assert result['incomplete_details']['reason'] == 'max_output_tokens'
+        else:
+            assert result['status'] == 'failed'
+            assert result['error']['code'] == ('context_length_exceeded' if case == 'json_error' else 'empty_upstream_response')
+            if not stream:
+                assert response.status_code == 502
+        assert 'internal reasoning' not in response.text
+    asyncio.run(run())
