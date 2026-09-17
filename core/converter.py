@@ -1045,13 +1045,8 @@ async def create_response(
                 status_code=status_code, detail=_safe_err_raw(raw, status_code)
             )
         converter = ResponsesStreamConverter(model=model_name)
-        response_text = raw.decode("utf-8-sig", "replace")
-        if response_text.lstrip().startswith(("{", "[")):
-            converter.feed_json(response_text)
-        else:
-            for line in response_text.splitlines():
-                converter.feed_line(line)
-            converter.validate_stream_end()
+        for line in raw.decode("utf-8", "replace").splitlines():
+            converter.feed_line(line)
         chat_body = final_body
     except HTTPException:
         raise
@@ -1098,20 +1093,13 @@ async def _stream_responses(
                     _log(f"{prefix}✗ HTTP {response.status_code} | {model_name}")
                     yield converter.error(raw.decode("utf-8", "replace")[:500], response.status_code).encode("utf-8")
                     return
-                if "json" in response.headers.get("content-type", "").lower():
-                    raw = await response.aread()
-                    yield converter.feed_json(raw.decode("utf-8-sig", "replace")).encode("utf-8")
-                else:
-                    async for line in response.aiter_lines():
-                        if line.strip():
-                            raw_sse_lines.append(line)
-                            raw_sse_lines = raw_sse_lines[-30:]
-                        events = converter.feed_line(line)
-                        if events:
-                            yield events.encode("utf-8")
-                    end_error = converter.validate_stream_end()
-                    if end_error:
-                        yield end_error.encode("utf-8")
+                async for line in response.aiter_lines():
+                    if line.strip():
+                        raw_sse_lines.append(line)
+                        raw_sse_lines = raw_sse_lines[-30:]
+                    events = converter.feed_line(line)
+                    if events:
+                        yield events.encode("utf-8")
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield converter.error(str(e)[:500], 502).encode("utf-8")
