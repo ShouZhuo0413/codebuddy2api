@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from core import converter
 from admin.server import Store
-from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages
+from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, request_affinity
 from test_admin_server import credential
 
 
@@ -65,6 +65,56 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.pool.select()[0],self.b)
         self.store.data['pool']['routing']='manual';self.store.data['active']=self.a
         with self.assertRaises(HTTPException):self.pool.select()
+
+    def test_affinity_failover_persistence_expiry_and_manual(self):
+        key = request_affinity({b'authorization': b'Bearer api-test'}, {'model': 'm', 'prompt_cache_key': 'session-one'})
+        self.assertEqual([self.pool.select(key)[0] for _ in range(3)], [self.a] * 3)
+        self.pool.record(self.a)
+        self.assertEqual(AccountPool(self.store, clock=lambda: self.now).select(key)[0], self.a)
+        self.pool.record(self.a, 429)
+        self.assertEqual(self.pool.select(key)[0], self.b)
+        self.now += 1801
+        self.assertEqual(self.pool.select(key)[0], self.b)
+        self.store.data['pool']['routing'] = 'manual'
+        self.store.data['active'] = self.a
+        self.assertEqual(self.pool.select(key)[0], self.a)
+        self.now += 86401
+        self.pool.select()
+        self.assertNotIn(key, self.store.data['session_bindings'])
+
+    def test_affinity_is_scoped_to_caller_model_and_session(self):
+        headers = {b'authorization': b'Bearer one'}
+        body = {'model': 'm', 'prompt_cache_key': 'secret-session'}
+        key = request_affinity(headers, body)
+        self.assertEqual(len(key), 64)
+        self.assertNotEqual(key, request_affinity({b'authorization': b'Bearer two'}, body))
+        self.assertNotEqual(key, request_affinity(headers, dict(body, model='other')))
+        self.assertEqual(key, request_affinity(headers, dict(body, input='next question')))
+        self.assertEqual(request_affinity(headers, {'input': [{'role': 'user', 'content': 'first'}]}),
+                         request_affinity(headers, {'input': [{'role': 'user', 'content': 'first'}, {'role': 'user', 'content': 'next'}]}))
+
+    async def test_middleware_replays_body_and_reuses_session_account(self):
+        seen = []
+        async def app(scope, receive, send):
+            message = await receive()
+            seen.append((REQUEST_CREDENTIAL.get().path.name, json.loads(message['body'])))
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'ok'})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            bodies = [{'prompt_cache_key': 'same', 'input': 'first'}, {'prompt_cache_key': 'same', 'input': 'next'}]
+            for body in bodies:
+                response = await client.post('/v1/responses', json=body, headers={'Authorization': 'Bearer api-test'})
+                self.assertEqual(response.status_code, 200)
+        self.assertEqual(seen[0][0], seen[1][0])
+        self.assertEqual([item[1] for item in seen], bodies)
+
+    async def test_responses_failed_event_cools_account(self):
+        async def app(scope, receive, send):
+            await send({'type': 'http.response.start', 'status': 200, 'headers': [(b'content-type', b'text/event-stream')]})
+            await send({'type': 'http.response.body', 'body': b'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"429"}}}\n\n'})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app, self.pool)), base_url='http://test') as client:
+            await client.post('/v1/responses', json={'input': 'hello'}, headers={'Authorization': 'Bearer api-test'})
+        self.assertGreater(self.store.data['account_status'][self.a]['cooldown_until'], self.now)
 
     async def test_checkin_idempotent_and_failure_retains_balance(self):
         a,b=await asyncio.gather(asyncio.to_thread(self.pool.operate,self.a,'checkin'),asyncio.to_thread(self.pool.operate,self.a,'checkin'))

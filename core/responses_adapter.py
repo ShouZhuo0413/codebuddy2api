@@ -62,7 +62,12 @@ def responses_request_to_chat(body: dict) -> dict:
     if tools:
         chat["tools"] = _convert_tools_for_chat(tools)
     if "tool_choice" in body:
-        chat["tool_choice"] = body["tool_choice"]
+        choice = body["tool_choice"]
+        if isinstance(choice, dict) and choice.get("type") == "function" and "name" in choice:
+            choice = {"type": "function", "function": {"name": choice["name"]}}
+        chat["tool_choice"] = choice
+    if "parallel_tool_calls" in body:
+        chat["parallel_tool_calls"] = body["parallel_tool_calls"]
 
     # 透传常见参数
     for key in ("temperature", "top_p", "stop", "seed",
@@ -267,6 +272,11 @@ class ResponsesStreamConverter:
         self._tool_calls: dict[int, dict] = {}  # index → {id, name, args, fc_id, output_idx, emitted}
         self._finish_reason: str | None = None
         self._usage: dict | None = None
+        self._sequence_number = 0
+        self._next_output_index = 0
+        self._msg_output_index = None
+        self._error = None
+        self._finished = False
 
     # ---- 公开接口 ----
 
@@ -286,22 +296,26 @@ class ResponsesStreamConverter:
 
     def finish(self) -> str:
         """流结束后，发出收尾事件（done + completed）。"""
+        if self._finished or self._error:
+            return ""
+        self._finished = True
         events: list[str] = []
+        response = self._response_obj("completed")
 
         # 关闭 text content
         if self._emitted_content_part:
             events.append(self._evt("response.output_text.done", {
-                "output_index": 0, "content_index": 0, "text": self._content
+                "output_index": self._msg_output_index, "item_id": self.msg_id, "content_index": 0, "text": self._content
             }))
             events.append(self._evt("response.content_part.done", {
-                "output_index": 0, "content_index": 0,
+                "output_index": self._msg_output_index, "item_id": self.msg_id, "content_index": 0,
                 "part": {"type": "output_text", "text": self._content, "annotations": []}
             }))
 
         if self._emitted_msg_item:
             events.append(self._evt("response.output_item.done", {
-                "output_index": 0,
-                "item": self._msg_item("completed")
+                "output_index": self._msg_output_index,
+                "item": self._msg_item(response["status"])
             }))
 
         # 关闭 function calls
@@ -310,15 +324,15 @@ class ResponsesStreamConverter:
             if tc.get("emitted"):
                 oi = tc["output_idx"]
                 events.append(self._evt("response.function_call_arguments.done", {
-                    "output_index": oi, "arguments": tc["args"]
+                    "output_index": oi, "item_id": tc["fc_id"], "arguments": tc["args"]
                 }))
                 events.append(self._evt("response.output_item.done", {
-                    "output_index": oi, "item": self._fc_item(tc, "completed")
+                    "output_index": oi, "item": self._fc_item(tc, response["status"])
                 }))
 
         # response.completed
-        events.append(self._evt("response.completed", {
-            "response": self._response_obj("completed")
+        events.append(self._evt("response." + response["status"], {
+            "response": response
         }))
         return "".join(events)
 
@@ -330,6 +344,13 @@ class ResponsesStreamConverter:
 
     def _process_chunk(self, chunk: dict) -> str:
         events: list[str] = []
+        if self._error or self._finished:
+            return ""
+        if chunk.get("error"):
+            error = chunk["error"]
+            if isinstance(error, dict):
+                return self.error(error.get("message", str(error)), error.get("code", "upstream_error"))
+            return self.error(str(error), "upstream_error")
 
         # 模型名
         if chunk.get("model"):
@@ -344,41 +365,48 @@ class ResponsesStreamConverter:
 
         # usage
         if chunk.get("usage"):
-            self._usage = chunk["usage"]
+            if self._usage is None:
+                self._usage = {}
+            for key, value in chunk["usage"].items():
+                if isinstance(value, dict) and isinstance(self._usage.get(key), dict):
+                    self._usage[key].update(value)
+                elif value is not None:
+                    self._usage[key] = value
 
-        for choice in chunk.get("choices", []):
-            delta = choice.get("delta", {})
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
             finish = choice.get("finish_reason")
 
             # ---- content delta ----
             content = delta.get("content")
             if content:
                 if not self._emitted_msg_item:
+                    self._msg_output_index = self._next_output_index
+                    self._next_output_index += 1
                     events.append(self._evt("response.output_item.added", {
-                        "output_index": 0,
+                        "output_index": self._msg_output_index,
                         "item": self._msg_item("in_progress", empty=True)
                     }))
                     self._emitted_msg_item = True
 
                 if not self._emitted_content_part:
                     events.append(self._evt("response.content_part.added", {
-                        "output_index": 0, "content_index": 0,
+                        "output_index": self._msg_output_index, "item_id": self.msg_id, "content_index": 0,
                         "part": {"type": "output_text", "text": "", "annotations": []}
                     }))
                     self._emitted_content_part = True
 
                 self._content += content
                 events.append(self._evt("response.output_text.delta", {
-                    "output_index": 0, "content_index": 0, "delta": content
+                    "output_index": self._msg_output_index, "item_id": self.msg_id, "content_index": 0, "delta": content
                 }))
 
             # ---- tool_calls delta ----
-            for tc in delta.get("tool_calls", []):
+            for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 if idx not in self._tool_calls:
-                    # 计算 output_index：msg 占 0，function_call 从 1 开始（如果有 msg）
-                    base = 1 if (self._emitted_msg_item or self._content) else 0
-                    oi = base + len(self._tool_calls)
+                    oi = self._next_output_index
+                    self._next_output_index += 1
                     self._tool_calls[idx] = {
                         "id": tc.get("id", ""),
                         "name": "",
@@ -408,6 +436,7 @@ class ResponsesStreamConverter:
                     slot["args"] += fn["arguments"]
                     events.append(self._evt("response.function_call_arguments.delta", {
                         "output_index": slot["output_idx"],
+                        "item_id": slot["fc_id"],
                         "delta": fn["arguments"]
                     }))
 
@@ -416,10 +445,17 @@ class ResponsesStreamConverter:
 
         return "".join(events)
 
+    def error(self, message: str, code) -> str:
+        if self._error or self._finished:
+            return ""
+        self._error = {"message": message, "code": str(code), "type": "upstream_error"}
+        return self._evt("response.failed", {"response": self._response_obj("failed")})
+
     def _evt(self, event_type: str, data: dict) -> str:
         """格式化一个 SSE 事件。"""
-        payload = {"type": event_type, **data}
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        payload = {"type": event_type, "sequence_number": self._sequence_number, **data}
+        self._sequence_number += 1
+        return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     def _msg_item(self, status: str = "in_progress", empty: bool = False) -> dict:
         content = [] if empty else [
@@ -444,6 +480,12 @@ class ResponsesStreamConverter:
         }
 
     def _response_obj(self, status: str) -> dict:
+        incomplete = None
+        if self._error:
+            status = "failed"
+        elif status == "completed" and self._finish_reason in ("length", "content_filter", "content-filter"):
+            status = "incomplete"
+            incomplete = {"reason": "max_output_tokens" if self._finish_reason == "length" else "content_filter"}
         output = []
         if self._emitted_msg_item or self._content:
             output.append(self._msg_item(status))
@@ -451,16 +493,19 @@ class ResponsesStreamConverter:
             tc = self._tool_calls[idx]
             if tc.get("emitted"):
                 output.append(self._fc_item(tc, status))
+        indices = {tc["fc_id"]: tc["output_idx"] for tc in self._tool_calls.values()}
+        indices[self.msg_id] = self._msg_output_index
+        output.sort(key=lambda item: indices[item["id"]])
 
         usage = None
         if self._usage:
             u = self._usage
             usage = {
                 "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)),
-                "input_tokens_details": {"cached_tokens": 0},
+                "input_tokens_details": {"cached_tokens": _cached_tokens(u)},
                 "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)),
                 "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": u.get("total_tokens", 0),
+                "total_tokens": u.get("total_tokens", u.get("prompt_tokens", u.get("input_tokens", 0)) + u.get("completion_tokens", u.get("output_tokens", 0))),
             }
 
         return {
@@ -468,8 +513,23 @@ class ResponsesStreamConverter:
             "object": "response",
             "created_at": self.created_at,
             "status": status,
+            "error": self._error,
+            "incomplete_details": incomplete,
             "model": self.model,
             "output": output,
             "parallel_tool_calls": True,
             "usage": usage,
         }
+
+
+def _cached_tokens(usage: dict) -> int:
+    values = [
+        (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+        (usage.get("input_tokens_details") or {}).get("cached_tokens"),
+        usage.get("cache_read_input_tokens"), usage.get("prompt_cache_hit_tokens"),
+        usage.get("cached_tokens"),
+    ]
+    for value in values:
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return int(value)
+    return 0

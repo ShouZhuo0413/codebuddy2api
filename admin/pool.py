@@ -1,5 +1,6 @@
 """Account-scoped billing, refresh, daily check-in and request routing."""
 import asyncio
+import hashlib
 import json
 import math
 import threading
@@ -61,6 +62,7 @@ class AccountPool:
         with store.lock:
             store.data.setdefault("pool", {"routing": "round_robin", "auto_checkin": True, "checkin_time": "09:00"})
             store.data.setdefault("account_status", {})
+            store.data.setdefault("session_bindings", {})
             store.save()
 
     def operation_lock(self, aid):
@@ -103,15 +105,28 @@ class AccountPool:
                         "request_count": status.get("request_count", 0)})
         return rows
 
-    def select(self):
+    def select(self, affinity_key=None):
         with self.store.lock:
             candidates = [row for row in self.store.account_rows() if self.state(row) == "available"]
             if self.store.data["pool"]["routing"] == "manual":
                 candidates = [row for row in candidates if row["id"] == self.store.data["active"]]
             if not candidates:
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
-            aid = candidates[self.cursor % len(candidates)]["id"]
-            self.cursor += 1
+            now = self.clock()
+            bindings = self.store.data["session_bindings"]
+            for key in list(bindings):
+                if bindings[key].get("expires", 0) <= now:
+                    del bindings[key]
+            bound = bindings.get(affinity_key, {}).get("account_id")
+            if bound in {row["id"] for row in candidates}:
+                aid = bound
+            else:
+                aid = candidates[self.cursor % len(candidates)]["id"]
+                self.cursor += 1
+            if affinity_key:
+                if affinity_key not in bindings and len(bindings) >= 4096:
+                    del bindings[min(bindings, key=lambda key: bindings[key]["expires"])]
+                bindings[affinity_key] = {"account_id": aid, "expires": now + 86400}
             item = self.store.data["accounts"][aid]
             return aid, self.store.manager_for(aid, item)
 
@@ -264,6 +279,36 @@ class AccountPool:
             self.last_sync = self.clock()
 
 
+def request_affinity(headers, body):
+    """Persist only a hash of caller/model/session identity, never raw prompts or keys."""
+    if not isinstance(body, dict):
+        return None
+    identity = None
+    for name in (b"x-session-id", b"session_id", b"x-conversation-id"):
+        if headers.get(name):
+            identity = [name.decode(), headers[name].decode(errors="replace")]
+            break
+    if identity is None:
+        for name in ("prompt_cache_key", "conversation_id", "session_id"):
+            if body.get(name):
+                identity = [name, body[name]]
+                break
+    if identity is None:
+        messages = body.get("messages", body.get("input", []))
+        if isinstance(messages, str) and messages:
+            identity = ["first_user", messages]
+        elif isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, dict) and message.get("role") == "user":
+                    identity = ["first_user", message.get("content", "")]
+                    break
+    if identity is None:
+        return None
+    caller = headers.get(b"authorization") or headers.get(b"x-api-key", b"")
+    value = [caller.decode(errors="replace"), body.get("model", "auto"), identity]
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
 class PoolMiddleware:
     def __init__(self, app, pool):
         self.app, self.pool = app, pool
@@ -274,14 +319,39 @@ class PoolMiddleware:
         headers = dict(scope.get("headers", []))
         try:
             self.pool.store.check_api(headers.get(b"authorization", b"").decode(), headers.get(b"x-api-key", b"").decode())
-            aid, manager = self.pool.select()
+            raw = bytearray()
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    return
+                raw.extend(message.get("body", b""))
+                if len(raw) > 32 * 1024 * 1024:
+                    raise HTTPException(413, "请求体超过 32 MiB")
+                if not message.get("more_body", False):
+                    break
+            raw = bytes(raw)
+            try:
+                body = json.loads(raw) if raw else {}
+            except ValueError:
+                body = {}
+            affinity_key = request_affinity(headers, body)
+            original_receive = receive
+            delivered = False
+            async def replay_receive():
+                nonlocal delivered
+                if not delivered:
+                    delivered = True
+                    return {"type": "http.request", "body": raw, "more_body": False}
+                return await original_receive()
+            receive = replay_receive
+            aid, manager = self.pool.select(affinity_key)
             # Refresh before entering a stream; retry another eligible account only
             # if credential preparation fails, never replay a partially emitted response.
             try:
                 await asyncio.to_thread(manager.get_headers)
             except Exception:
                 self.pool.update(aid, cooldown_until=self.pool.clock()+300, last_error="凭据暂不可用，已冷却 5 分钟")
-                aid, manager = self.pool.select()
+                aid, manager = self.pool.select(affinity_key)
                 await asyncio.to_thread(manager.get_headers)
         except HTTPException as e:
             return await JSONResponse({"detail": e.detail}, e.status_code)(scope, receive, send)
@@ -301,8 +371,10 @@ class PoolMiddleware:
                     if line.startswith(b"data:"):
                         try:
                             obj = json.loads(line[5:])
-                            err = obj.get("error") or {}
+                            err = obj.get("error") or (obj.get("response") or {}).get("error") or {}
                             code = err.get("code") if isinstance(err, dict) else None
+                            if isinstance(code, str) and code.isdigit():
+                                code = int(code)
                             if code in (401, 402, 403, 429):
                                 status = code
                         except (ValueError, AttributeError):
