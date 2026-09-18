@@ -406,13 +406,13 @@ def test_stream_converter_text():
     for line in chunks:
         result = conv.feed_line(line)
         if result:
-            for evt_line in result.strip().split("\n\n"):
+            for evt_line in result.splitlines():
                 if evt_line.startswith("data: "):
                     all_events.append(json.loads(evt_line[6:]))
 
     # 收尾
     finish = conv.finish()
-    for evt_line in finish.strip().split("\n\n"):
+    for evt_line in finish.splitlines():
         if evt_line.startswith("data: "):
             all_events.append(json.loads(evt_line[6:]))
 
@@ -459,12 +459,12 @@ def test_stream_converter_function_call():
     for line in chunks:
         result = conv.feed_line(line)
         if result:
-            for evt_line in result.strip().split("\n\n"):
+            for evt_line in result.splitlines():
                 if evt_line.startswith("data: "):
                     all_events.append(json.loads(evt_line[6:]))
 
     finish = conv.finish()
-    for evt_line in finish.strip().split("\n\n"):
+    for evt_line in finish.splitlines():
         if evt_line.startswith("data: "):
             all_events.append(json.loads(evt_line[6:]))
 

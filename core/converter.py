@@ -58,6 +58,7 @@ from .responses_adapter import (
     responses_request_to_chat,
 )
 from .responses_projection import project_responses_chat_body
+from .system_identity import filter_system_identity
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -569,13 +570,15 @@ async def chat_completions(
             for m in body["messages"]
         ]
 
+    body = filter_system_identity(body)
+
     # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
     # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
     if CONFIG.get("desensitize"):
         body = desensitize_body(
             body,
             roles=("system", "developer"),
-            desensitize_harness_user=True,
+            desensitize_harness_user=False,
             desensitize_tools=True,
             compact_harness=not CONFIG.get("no_compact"),
             strip_tool_metadata=True,
@@ -901,7 +904,7 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
     return desensitize_body(
         body,
         roles=("system", "developer"),
-        desensitize_harness_user=True,
+        desensitize_harness_user=False,
         desensitize_tools=True,
         compact_harness=(force_compact or not CONFIG.get("no_compact")),
         strip_tool_metadata=True,
@@ -929,6 +932,7 @@ async def _post_backend_with_filter_retry(
         and _looks_like_content_filter_text(text)
         and CONFIG.get("desensitize")
         and CONFIG.get("no_compact")
+        and os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1"
     ):
         retry_body = _chat_body_desensitize(body, force_compact=True)
         _log(
@@ -988,15 +992,19 @@ async def create_response(
             },
         )
 
-    chat_body, projection_stats = project_responses_chat_body(chat_body)
+    chat_body = filter_system_identity(chat_body)
+    chat_body, projection_stats = project_responses_chat_body(
+        chat_body, preserve=os.environ.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
+    )
     chat_body.setdefault("model", "auto")
     chat_body["stream"] = True
     if "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
-    chat_body = _chat_body_desensitize(chat_body)
+    if os.environ.get("CODEBUDDY_RESPONSES_DESENSITIZE", "0") == "1":
+        chat_body = _chat_body_desensitize(chat_body)
 
-    client_wants_stream = payload.get("stream", True)  # Codex CLI 默认 stream
+    client_wants_stream = bool(payload.get("stream", False))
     model_name = payload.get("model", "auto")
     rid = os.urandom(4).hex()
     _log(
@@ -1056,12 +1064,16 @@ async def create_response(
         )
 
     result = converter.get_nonstream_response()
+    response_status = 200
+    if result.get("error"):
+        code = result["error"].get("code", "")
+        response_status = int(code) if str(code).isdigit() and 400 <= int(code) <= 599 else 502
     elapsed = time.time() - t0
     _log(f"[{rid}] ◀ RESPONSES {model_name} | {elapsed:.1f}s")
     _log(
         f"[{rid}] ── RESPONSE OBJ ──\n{json.dumps(result, ensure_ascii=False, indent=2)}"
     )
-    return JSONResponse(content=result)
+    return JSONResponse(content=result, status_code=response_status)
 
 
 async def _stream_responses(
@@ -1076,34 +1088,25 @@ async def _stream_responses(
     converter = ResponsesStreamConverter(model=model_name)
     prefix = f"[{rid}] " if rid else ""
 
+    raw_sse_lines = []
     try:
-        status_code, raw, _ = await _post_backend_with_filter_retry(
-            url, headers, body, rid, model_name
-        )
-        if status_code != 200:
-            _log(
-                f"{prefix}✗ HTTP {status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
-            )
-            error_evt = {
-                "type": "error",
-                "error": {
-                    "message": raw.decode("utf-8", "replace")[:500],
-                    "code": status_code,
-                },
-            }
-            yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
-            return
-        raw_sse_lines = []
-        for line in raw.decode("utf-8", "replace").splitlines():
-            if line.strip():
-                raw_sse_lines.append(line)
-            events = converter.feed_line(line)
-            if events:
-                yield events.encode("utf-8")
+        async with httpx.AsyncClient(timeout=300) as client:
+            async with client.stream("POST", url, headers=headers, json=body) as response:
+                if response.status_code != 200:
+                    raw = await response.aread()
+                    _log(f"{prefix}✗ HTTP {response.status_code} | {model_name}")
+                    yield converter.error(raw.decode("utf-8", "replace")[:500], response.status_code).encode("utf-8")
+                    return
+                async for line in response.aiter_lines():
+                    if line.strip():
+                        raw_sse_lines.append(line)
+                        raw_sse_lines = raw_sse_lines[-30:]
+                    events = converter.feed_line(line)
+                    if events:
+                        yield events.encode("utf-8")
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
-        error_evt = {"type": "error", "error": {"message": str(e)[:500], "code": 502}}
-        yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
+        yield converter.error(str(e)[:500], 502).encode("utf-8")
         return
 
     # 发送收尾事件
@@ -1180,11 +1183,12 @@ async def create_message(
     if "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
+    chat_body = filter_system_identity(chat_body)
     if CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,
             roles=("system", "developer"),
-            desensitize_harness_user=True,
+            desensitize_harness_user=False,
             desensitize_tools=True,
             compact_harness=not CONFIG.get("no_compact"),
             strip_tool_metadata=True,
@@ -1373,11 +1377,12 @@ async def count_tokens(
     chat_body["stream"] = True  # 后端只支持流式
     chat_body["stream_options"] = {"include_usage": True}
 
+    chat_body = filter_system_identity(chat_body)
     if CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,
             roles=("system", "developer"),
-            desensitize_harness_user=True,
+            desensitize_harness_user=False,
             desensitize_tools=True,
             compact_harness=not CONFIG.get("no_compact"),
             strip_tool_metadata=True,

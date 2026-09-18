@@ -181,10 +181,10 @@ def test_tool_result_with_user_text():
     chat = anthropic_request_to_chat(req)
     msgs = chat["messages"]
 
-    assert msgs[0]["role"] == "user"
-    assert msgs[0]["content"] == "Continue."
-    assert msgs[1]["role"] == "tool"
-    assert msgs[1]["tool_call_id"] == "toolu_xyz"
+    assert msgs[0]["role"] == "tool"
+    assert msgs[0]["tool_call_id"] == "toolu_xyz"
+    assert msgs[1]["role"] == "user"
+    assert msgs[1]["content"] == "Continue."
     print("✅ test_tool_result_with_user_text")
 
 

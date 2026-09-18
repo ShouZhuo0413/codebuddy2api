@@ -114,24 +114,22 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 检查是否包含 tool_result（role=user 时）
     if role == "user":
         result: list[dict] = []
-        text_parts: list[str] = []
+        user_blocks: list[dict] = []
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             bt = block.get("type", "")
-            if bt == "text":
-                text_parts.append(block.get("text", ""))
-            elif bt == "tool_result":
+            if bt == "tool_result":
                 # tool_result → 独立的 tool 消息
                 tc_id = block.get("tool_use_id", "")
                 output = block.get("content", "")
-                if isinstance(output, list):
-                    output = "".join(
-                        b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"
-                    )
+                output = _convert_image_content(output)
                 result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
-        if text_parts:
-            result.insert(0, {"role": "user", "content": "".join(text_parts)})
+            else:
+                user_blocks.append(block)
+        if user_blocks:
+            # Chat requires tool results immediately after the assistant tool calls.
+            result.append({"role": "user", "content": _convert_image_content(user_blocks)})
         return result
 
     # assistant 角色
@@ -166,6 +164,44 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 其他角色：尝试提取文本
     text = _extract_blocks_text(blocks)
     return [{"role": role, "content": text}] if text else []
+
+
+def _convert_image_content(content) -> str | list:
+    """Map Anthropic text/image blocks to Chat, preserving image bytes and order."""
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if not isinstance(content, list):
+        raise ValueError("Anthropic content must be a string or a list of blocks")
+    parts = []
+    has_image = False
+    for block in content:
+        if not isinstance(block, dict):
+            raise ValueError("Anthropic content blocks must be objects")
+        kind = block.get("type")
+        if kind == "text":
+            parts.append({"type": "text", "text": block.get("text", "")})
+        elif kind == "image":
+            source = block.get("source") or {}
+            if not isinstance(source, dict):
+                raise ValueError("Image source must be an object")
+            if source.get("type") == "url":
+                url = source.get("url")
+                if not isinstance(url, str) or not url.strip():
+                    raise ValueError("Image URL must be non-empty")
+            elif source.get("type") == "base64":
+                data, media_type = source.get("data"), source.get("media_type")
+                if not isinstance(data, str) or not data or not isinstance(media_type, str) or not media_type.startswith("image/"):
+                    raise ValueError("Base64 images require data and an image media_type")
+                url = f"data:{media_type};base64,{data}"
+            else:
+                raise ValueError("Image source must use url or base64; file references are not supported")
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+            has_image = True
+        else:
+            raise ValueError(f"Unsupported Anthropic content block: {kind!r}")
+    return parts if has_image else "".join(part["text"] for part in parts)
 
 
 def _extract_blocks_text(blocks: list) -> str:

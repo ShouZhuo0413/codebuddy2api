@@ -101,11 +101,22 @@ SCHEMA_KEEP_KEYS = {
 }
 
 
-def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
+def project_responses_chat_body(body: dict, *, preserve: bool = False) -> tuple[dict, dict]:
     """把 Responses 转出来的 Chat body 投影成更适合腾讯后端的最小上下文。"""
     projected = dict(body)
     messages = list(body.get("messages") or [])
     tools = list(body.get("tools") or [])
+
+    if preserve:
+        return projected, {
+            "mode": "preserve", "aggressive": False,
+            "original_messages": len(messages), "projected_messages": len(messages),
+            "original_message_chars": _messages_size(messages),
+            "projected_message_chars": _messages_size(messages),
+            "original_tools": len(tools), "projected_tools": len(tools),
+            "original_tool_chars": len(json.dumps(tools, ensure_ascii=False)),
+            "projected_tool_chars": len(json.dumps(tools, ensure_ascii=False)),
+        }
 
     projected_tools, tool_stats = _project_tools(tools)
     if projected_tools:
