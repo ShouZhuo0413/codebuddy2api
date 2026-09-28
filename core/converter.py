@@ -53,6 +53,11 @@ from .anthropic_adapter import (
     AnthropicStreamConverter,
     anthropic_request_to_chat,
 )
+from .workbuddy_atrest_crypto import (  # issue #23：WorkBuddy 5.6.0 $wbEncrypted 信封
+    decrypt_auth_field,
+    encrypt_auth_field,
+    is_encrypted_field,
+)
 from .responses_adapter import (
     ResponsesStreamConverter,
     responses_request_to_chat,
@@ -149,7 +154,7 @@ class CredentialManager:
         s = self._session()
         auth = s.get("auth") or {}
         headers = self._build_headers_from(auth, s.get("account") or {})
-        headers["X-Refresh-Token"] = auth.get("refreshToken", "")
+        headers["X-Refresh-Token"] = decrypt_auth_field(auth.get("refreshToken", ""))
         headers["X-Auth-Refresh-Source"] = "plugin"
         url = f"{BACKEND}/v2/plugin/auth/token/refresh"
         try:
@@ -163,8 +168,10 @@ class CredentialManager:
         new_auth = data["data"]
         if not isinstance(new_auth, dict) or not new_auth.get("accessToken"):
             raise RuntimeError("刷新响应缺少访问令牌")
-        new_auth["refreshToken"] = new_auth.get("refreshToken") or auth.get("refreshToken", "")
-        # 继承部分字段
+        # 继承部分字段（refreshToken 兜底取解密后的旧值，避免加密信封被二次加密）
+        new_auth["refreshToken"] = new_auth.get("refreshToken") or decrypt_auth_field(
+            auth.get("refreshToken", "")
+        )
         new_auth["domain"] = new_auth.get("domain") or auth.get("domain")
         new_auth["lastRefreshTime"] = int(time.time() * 1000)
         # 计算 expiresAt（若后端没直接给）
@@ -177,6 +184,11 @@ class CredentialManager:
                 int(time.time() * 1000) + new_auth["refreshExpiresIn"] * 1000
             )
         s["auth"] = new_auth
+        # issue #23：若原文件为 $wbEncrypted 加密格式，回写前必须重新加密，
+        # 否则 WorkBuddy 客户端读到明文会报 integrity 错误、可能重置登录态。
+        if is_encrypted_field(auth.get("accessToken")):
+            new_auth["accessToken"] = encrypt_auth_field(decrypt_auth_field(new_auth["accessToken"]))
+            new_auth["refreshToken"] = encrypt_auth_field(decrypt_auth_field(new_auth["refreshToken"]))
         # 原子写回
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -190,7 +202,7 @@ class CredentialManager:
         h = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "Authorization": f"Bearer {auth.get('accessToken', '')}",
+            "Authorization": f"Bearer {decrypt_auth_field(auth.get('accessToken', ''))}",
             "X-User-Id": account.get("uid", ""),
             "X-Enterprise-Id": account.get("enterpriseId", ""),
             "X-Tenant-Id": account.get("enterpriseId", ""),
