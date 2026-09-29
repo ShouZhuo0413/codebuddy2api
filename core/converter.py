@@ -71,7 +71,15 @@ from .system_identity import filter_system_identity
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
-USER_AGENT = "codebuddy2openai/2.0"
+
+# 使用端身份：取值来自 CodeBuddy CLI 的真实请求，后端据此在计费后台的「使用端」列归属调用来源。
+# 转发时统一使用这组固定值，使上游看到的调用方与真机一致；客户端升级后在此同步版本号。
+CLIENT_IDE_TYPE = "CLI"
+CLIENT_IDE_NAME = "CLI"
+CLIENT_IDE_VERSION = "2.159.0"
+CLIENT_PRODUCT = "SaaS"
+USER_AGENT = f"CLI/{CLIENT_IDE_VERSION} CodeBuddy/{CLIENT_IDE_VERSION}"
+REQUESTED_WITH = "XMLHttpRequest"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -208,6 +216,12 @@ class CredentialManager:
             "X-Tenant-Id": account.get("enterpriseId", ""),
             "X-Domain": domain,
             "User-Agent": USER_AGENT,
+            "X-Requested-With": REQUESTED_WITH,
+            # 使用端标识：后端据此在计费后台的「使用端」列归属调用来源。
+            "X-IDE-Type": CLIENT_IDE_TYPE,
+            "X-IDE-Name": CLIENT_IDE_NAME,
+            "X-IDE-Version": CLIENT_IDE_VERSION,
+            "X-Product": CLIENT_PRODUCT,
         }
         return h
 

@@ -50,6 +50,21 @@
 | OpenAI Models | `/v1/models` | 已支持 |
 | Health Check | `/health` | 已支持 |
 
+### 调用方身份
+
+转发到腾讯后端的每个请求都会携带一组固定的调用方身份头，取值对齐 CodeBuddy CLI 的真实请求：
+
+| 请求头 | 取值 |
+|------|------|
+| `X-IDE-Type` | `CLI` |
+| `X-IDE-Name` | `CLI` |
+| `X-IDE-Version` | `2.159.0` |
+| `X-Product` | `SaaS` |
+| `X-Requested-With` | `XMLHttpRequest` |
+| `User-Agent` | `CLI/2.159.0 CodeBuddy/2.159.0` |
+
+上游按前三个请求头在计费后台的「使用端」列归属调用来源；缺少时该列只显示为空。取值定义在 `core/converter.py` 顶部，`User-Agent` 由 `CLIENT_IDE_VERSION` 推导，客户端版本升级后只需改这一处。
+
 ---
 
 ## 3 分钟上手
@@ -459,6 +474,21 @@ Recommended use cases:
 - **Codex CLI** via `/v1/responses`
 - **Claude Code / CC Switch** via `/v1/messages`
 - **Cherry Studio / ZCode / LobeChat / Open WebUI** via `/v1/chat/completions`
+
+### Client Identity
+
+Every request forwarded to the Tencent backend carries a fixed set of caller identity headers, matching what the real CodeBuddy CLI sends:
+
+| Header | Value |
+|------|------|
+| `X-IDE-Type` | `CLI` |
+| `X-IDE-Name` | `CLI` |
+| `X-IDE-Version` | `2.159.0` |
+| `X-Product` | `SaaS` |
+| `X-Requested-With` | `XMLHttpRequest` |
+| `User-Agent` | `CLI/2.159.0 CodeBuddy/2.159.0` |
+
+Upstream uses the first three headers to attribute traffic in the **usage source** column of its billing console; without them the column stays empty. The values live at the top of `core/converter.py`, and `User-Agent` is derived from `CLIENT_IDE_VERSION`, so a client upgrade only needs that one change.
 
 ### Quick Start
 
