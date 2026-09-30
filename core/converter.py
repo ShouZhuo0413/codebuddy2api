@@ -104,8 +104,14 @@ def auth_dirs() -> list[Path]:
 def find_auth_file() -> Path | None:
     for d in auth_dirs():
         if d.is_dir():
-            for f in sorted(d.glob("*.info")):
-                return f
+            files = list(d.glob("*.info"))
+            if not files:
+                continue
+            # 优先用无时间戳后缀的 "当前" 文件；否则按 mtime 取最新
+            current = d / "workbuddy-desktop.info"
+            if current.is_file():
+                return current
+            return max(files, key=lambda p: p.stat().st_mtime)
     return None
 
 
