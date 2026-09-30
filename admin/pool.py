@@ -30,19 +30,71 @@ def number(value):
     return max(Decimal(0), n)
 
 
+def timestamp(value):
+    """Normalize an upstream time field to seconds since epoch.
+
+    Values arrive either as millisecond timestamps or as "YYYY-MM-DD HH:MM:SS"
+    text in Beijing time; empty or non-positive values mean "no deadline".
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        if seconds <= 0:
+            return None
+        return int(seconds / 1000) if seconds > 100000000000 else int(seconds)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text in {"-1", "0"}:
+            return None
+        if text.isdigit():
+            return timestamp(int(text))
+        try:
+            return int(datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN).timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def spendable_deadline(package, cycle):
+    """Deadline of the balance that is spendable right now.
+
+    Cycle balances expire with the cycle, one-off balances with their deduction
+    window; a package without a usable deadline never drives the schedule.
+    """
+    names = ("CycleEndTime", "PackageEndTime") if cycle else ("DeductionEndTime", "PackageEndTime", "ExpiredTime")
+    for name in names:
+        deadline = timestamp(package.get(name))
+        if deadline is not None:
+            return deadline
+    return None
+
+
 def summarize_packages(packages):
     remain = Decimal(0)
     size = Decimal(0)
+    expiring_at = None
+    expiring_amount = Decimal(0)
     for p in packages:
         # Precise values carry fractional credit balances; cycle values are spendable now.
-        prefix = "Cycle" if any(k in p for k in ["CycleCapacityRemainPrecise", "CycleCapacityRemain"]) else ""
+        cycle = any(k in p for k in ["CycleCapacityRemainPrecise", "CycleCapacityRemain"])
         def field(name, default=None):
-            return p.get(prefix + name + "Precise", p.get(prefix + name, default))
+            return p.get(("Cycle" if cycle else "") + name + "Precise", p.get(("Cycle" if cycle else "") + name, default))
         r = number(field("CapacityRemain"))
         capacity = number(field("CapacitySize", r))
-        remain += min(r, capacity) if capacity else r
+        usable = min(r, capacity) if capacity else r
+        remain += usable
         size += capacity
-    return {"remaining": float(remain), "capacity": float(size), "used": float(max(Decimal(0), size - remain)), "packages": len(packages)}
+        if usable > 0:
+            deadline = spendable_deadline(p, cycle)
+            if deadline is None:
+                continue
+            if expiring_at is None or deadline < expiring_at:
+                expiring_at, expiring_amount = deadline, usable
+            elif deadline == expiring_at:
+                expiring_amount += usable
+    return {"remaining": float(remain), "capacity": float(size), "used": float(max(Decimal(0), size - remain)),
+            "packages": len(packages), "expiring_at": expiring_at, "expiring_amount": float(expiring_amount)}
 
 
 class BillingError(Exception):
@@ -99,19 +151,39 @@ class AccountPool:
         for row in rows:
             status = self.store.data["account_status"].get(row["id"], {})
             row.update({"pool_state": self.state(row), "remaining": status.get("remaining"), "credits_updated": status.get("credits_updated"),
+                        "expiring_at": status.get("expiring_at"), "expiring_amount": status.get("expiring_amount"),
                         "credits_stale": status.get("credits_updated", 0) < self.clock() - 600,
                         "today_checked_in": status.get("checkin_date") == today, "cooldown_until": status.get("cooldown_until", 0),
                         "last_error": status.get("last_error"), "token_refreshed": status.get("token_refreshed"),
                         "request_count": status.get("request_count", 0)})
         return rows
 
+    def urgent(self, candidates):
+        """Narrow candidates to the accounts whose credits expire first.
+
+        Without any queried balance every account ranks equal, so the caller's
+        rotation decides and an unsynced pool keeps working by load spreading.
+        """
+        deadlines = {}
+        for row in candidates:
+            value = self.store.data["account_status"].get(row["id"], {}).get("expiring_at")
+            deadlines[row["id"]] = value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+        known = [value for value in deadlines.values() if value is not None]
+        if not known:
+            return list(candidates)
+        best = min(known)
+        return [row for row in candidates if deadlines[row["id"]] == best]
+
     def select(self, affinity_key=None):
         with self.store.lock:
             candidates = [row for row in self.store.account_rows() if self.state(row) == "available"]
-            if self.store.data["pool"]["routing"] == "manual":
+            routing = self.store.data["pool"]["routing"]
+            if routing == "manual":
                 candidates = [row for row in candidates if row["id"] == self.store.data["active"]]
             if not candidates:
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
+            if routing == "expiry_first":
+                candidates = self.urgent(candidates)
             now = self.clock()
             bindings = self.store.data["session_bindings"]
             for key in list(bindings):

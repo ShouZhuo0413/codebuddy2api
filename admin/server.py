@@ -63,6 +63,7 @@ class Store:
         self.managers = {}
         self.started = time.time()
         self.events = deque(maxlen=40)
+        self.switch_sync = {"at": 0, "imported": 0, "updated": 0, "skipped": 0, "stale": 0, "failed": 0, "reason": None}
         self.path = self.root / "state.json"
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -142,6 +143,131 @@ class Store:
             self.save()
             self.sync_active()
             return {"account_id": aid, "updated": False}
+
+    @staticmethod
+    def switch_accounts_path():
+        override = os.environ.get("WB_SWITCH_ACCOUNTS_FILE")
+        return Path(override) if override else Path.home() / ".wb-switch" / "accounts.json"
+
+    @staticmethod
+    def switch_credential(entry):
+        """Convert one workbuddy-switch entry into a pool credential document."""
+        if not isinstance(entry, dict):
+            return None
+        auth = dict(entry.get("auth_raw") or {})
+        account = dict(entry.get("profile_raw") or {})
+        # Top-level fields carry the switcher's latest refresh, so they beat auth_raw copies.
+        for field, key in (("access_token", "accessToken"), ("refresh_token", "refreshToken"),
+                           ("token_type", "tokenType"), ("domain", "domain")):
+            if entry.get(field):
+                auth[key] = entry[field]
+        for field, key in (("expiresAt", "expiresAt"), ("refreshExpiresAt", "refreshExpiresAt"),
+                           ("refreshedAt", "lastRefreshTime")):
+            if entry.get(field):
+                auth[key] = entry[field]
+        account.setdefault("uid", entry.get("uid"))
+        account.setdefault("nickname", entry.get("nickname"))
+        account.setdefault("enterpriseId", entry.get("enterpriseId") or "")
+        auth.setdefault("domain", entry.get("domain") or "")
+        doc = {"auth": auth, "account": account}
+        if entry.get("variant"):
+            doc["variant"] = entry["variant"]
+        return doc
+
+    def import_switch_account(self, doc):
+        with self.lock:
+            if len(self.data["accounts"]) >= 100:
+                return False
+            aid = secrets.token_hex(8)
+            write_json(self.auth_dir / (aid + ".info"), doc)
+            self.data["accounts"][aid] = {"file": aid + ".info",
+                                          "name": str(doc["account"].get("nickname") or "自动同步账号")[:60],
+                                          "created": int(time.time()), "enabled": True}
+            if self.data["active"] is None:
+                self.data["active"] = aid
+            self.save()
+            self.sync_active()
+            return True
+
+    @staticmethod
+    def switch_credential_is_newer(incoming, current):
+        """Adopt the switcher's copy only when it is genuinely newer.
+
+        Both sides refresh tokens independently, so a blind overwrite can roll the
+        pool back to a copy the upstream may already have rotated away. expiresAt is
+        stable per upstream session, hence lastRefreshTime breaks the tie.
+        """
+        def stamp(auth):
+            return (auth.get("expiresAt") or 0, auth.get("lastRefreshTime") or 0)
+        return stamp(incoming) > stamp(current)
+
+    def adopt_switch_credential(self, aid, item, doc):
+        """Take over a refreshed token while keeping the local account settings."""
+        manager = self.manager_for(aid, item)
+        with self.lock:
+            with manager._lock:
+                write_json(self.file_for(item), doc)
+                manager._cached, manager._mtime = None, 0.0
+
+    def sync_switch_accounts(self, source=None):
+        """Mirror the desktop switcher's account library into the pool.
+
+        New accounts join the pool by themselves and refreshed tokens are adopted, so
+        the two sides stop drifting apart. Local name, enabled flag, chosen active
+        account and cached balance stay untouched, and the switcher's file is never
+        written to.
+        """
+        source = Path(source) if source else self.switch_accounts_path()
+        summary = {"source": str(source), "imported": 0, "updated": 0, "skipped": 0, "stale": 0, "failed": 0, "reason": None}
+        try:
+            entries = json.loads(source.read_text(encoding="utf-8"))
+        except OSError:
+            summary["reason"] = "账号库不存在或不可读"
+        except ValueError:
+            summary["reason"] = "账号库格式异常"
+        else:
+            if not isinstance(entries, list):
+                entries, summary["reason"] = [], "账号库格式异常"
+            known = {}
+            with self.lock:
+                for aid, item in self.data["accounts"].items():
+                    try:
+                        doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    account = doc.get("account") or {}
+                    identity = (str(account.get("uid") or ""), str(account.get("enterpriseId") or ""))
+                    known[identity] = (aid, item, doc.get("auth") or {})
+            seen = set()
+            for entry in entries:
+                doc = self.switch_credential(entry)
+                try:
+                    self.validate_credential(doc)
+                except HTTPException:
+                    summary["failed"] += 1
+                    continue
+                identity = (doc["account"]["uid"], str(doc["account"].get("enterpriseId") or ""))
+                if identity in seen:
+                    summary["skipped"] += 1
+                    continue
+                seen.add(identity)
+                existing = known.get(identity)
+                if existing is None:
+                    summary["imported" if self.import_switch_account(doc) else "failed"] += 1
+                    continue
+                aid, item, previous = existing
+                if (doc["auth"].get("accessToken"), doc["auth"].get("refreshToken")) == (previous.get("accessToken"), previous.get("refreshToken")):
+                    summary["skipped"] += 1
+                    continue
+                if not self.switch_credential_is_newer(doc["auth"], previous):
+                    summary["stale"] += 1  # 本地凭据更新，保留本地，避免回退
+                    continue
+                self.adopt_switch_credential(aid, item, doc)
+                summary["updated"] += 1
+        with self.lock:
+            self.switch_sync = {"at": int(time.time()), "reason": summary["reason"],
+                                **{field: summary[field] for field in ("imported", "updated", "skipped", "stale", "failed")}}
+        return summary
 
     def file_for(self, item):
         path = self.auth_dir / item["file"]
@@ -253,11 +379,24 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
                     pass  # Per-account errors are persisted without credential data.
                 await asyncio.sleep(60)
         pool_task = asyncio.create_task(pool_worker())
+        sync_interval = int(os.environ.get("SWITCH_SYNC_INTERVAL") or 120)
+        sync_task = None
+        if sync_interval > 0:
+            async def switch_worker():
+                while True:
+                    try:
+                        await asyncio.to_thread(store.sync_switch_accounts)
+                    except Exception:
+                        pass  # A missing or unreadable library must never stop serving.
+                    await asyncio.sleep(sync_interval)
+            sync_task = asyncio.create_task(switch_worker())
         try:
             yield
         finally:
             cleanup_task.cancel()
             pool_task.cancel()
+            if sync_task:
+                sync_task.cancel()
             try:
                 await cleanup_task
             except asyncio.CancelledError:
@@ -374,7 +513,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         store.require_admin(req)
         with store.lock:
             keys = [{"id": kid, **{k: v for k, v in item.items() if k != "hash"}} for kid, item in store.data["keys"].items()]
-            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "metrics": metrics.snapshot(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
+            return {"accounts": pool.rows(store.account_rows()), "pool": dict(store.data["pool"]), "switch_sync": dict(store.switch_sync), "metrics": metrics.snapshot(), "keys": keys, "models": converter.get_available_models(), "uptime": int(time.time() - store.started), "events": list(store.events)}
 
     @app.post("/admin/api/accounts/{aid}/actions/{action}")
     async def account_action(aid: str, action: str, req: Request):
@@ -386,6 +525,8 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
     @app.post("/admin/api/pool/actions/{action}")
     async def pool_action(action: str, req: Request):
         store.require_admin(req)
+        if action == "sync":
+            return await asyncio.to_thread(store.sync_switch_accounts)
         if action not in ("status", "checkin"):
             raise HTTPException(404)
         return await pool.batch(action)
@@ -398,7 +539,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         with store.lock:
             settings = dict(store.data["pool"])
             if "routing" in body:
-                if body["routing"] not in ("manual", "round_robin"):
+                if body["routing"] not in ("manual", "round_robin", "expiry_first"):
                     raise HTTPException(400, "调度方式无效")
                 settings["routing"] = body["routing"]
             if "auto_checkin" in body:
@@ -552,4 +693,11 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
 
 
 if __name__ == "__main__":
-    uvicorn.run(create_app(), host="0.0.0.0", port=8787, log_level="warning", proxy_headers=True, forwarded_allow_ips="*")
+    # 本地部署的可配置项（默认值保持原行为不变，仅监听回环时需显式覆盖）：
+    #   ADMIN_HOST          绑定地址，默认 0.0.0.0
+    #   ADMIN_PORT          监听端口，默认 8787
+    #   ADMIN_COOKIE_SECURE 置 0 时不加 Secure 标志，供回环 http 场景登录使用
+    secure_cookie = os.environ.get("ADMIN_COOKIE_SECURE", "1").lower() not in ("0", "false", "no", "off")
+    host = os.environ.get("ADMIN_HOST", "0.0.0.0")
+    port = int(os.environ.get("ADMIN_PORT", "8787"))
+    uvicorn.run(create_app(secure_cookie=secure_cookie), host=host, port=port, log_level="warning", proxy_headers=True, forwarded_allow_ips="*")

@@ -3,6 +3,7 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -50,6 +51,43 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['remaining'],479.71)
         with self.assertRaises(ValueError): summarize_packages([{}])
         self.assertEqual(self.pool.state(self.store.account_rows()[0]),'available')
+
+    def test_package_deadline_tracks_soonest_spendable_balance(self):
+        result=summarize_packages([{'CycleCapacityRemainPrecise':'375.28','CycleCapacitySizePrecise':500,'CycleEndTime':'2026-09-30 23:59:59','DeductionEndTime':2050662677000},
+                                   {'CapacityRemainPrecise':'100','CapacitySize':100,'DeductionEndTime':1792931479000}])
+        self.assertEqual(result['expiring_at'],int(datetime(2026,9,30,23,59,59,tzinfo=timezone(timedelta(hours=8))).timestamp()))
+        self.assertEqual(result['expiring_amount'],375.28)
+        # 毫秒与文本两种时间格式都要能比较，且同批次的额度要累加
+        milliseconds=summarize_packages([{'CapacityRemainPrecise':'10','CapacitySize':10,'DeductionEndTime':1792931479000},
+                                         {'CapacityRemainPrecise':'5','CapacitySize':5,'DeductionEndTime':'2027-01-15 20:31:19'}])
+        self.assertEqual(milliseconds['expiring_at'],int(datetime(2026,10,25,20,31,19,tzinfo=timezone(timedelta(hours=8))).timestamp()))
+        self.assertEqual(milliseconds['expiring_amount'],10.0)
+        self.assertIsNone(summarize_packages([{'CapacityRemainPrecise':'10','CapacitySize':10}])['expiring_at'])
+
+    def test_expiry_first_uses_soonest_deadline_then_rotates(self):
+        self.store.data['pool']['routing']='expiry_first'
+        # 尚未查询积分时退回轮转，未同步的账号池仍可服务
+        self.assertEqual([self.pool.select()[0] for _ in range(2)],[self.a,self.b])
+        self.pool.update(self.a,expiring_at=self.now+86400)
+        self.pool.update(self.b,expiring_at=self.now+3600)
+        self.assertEqual([self.pool.select()[0] for _ in range(3)],[self.b]*3)
+        self.pool.update(self.b,remaining=0,packages=1,credits_updated=self.now)
+        self.assertEqual(self.pool.select()[0],self.a)
+        # 到期时间未知的账号排在已知账号之后，但仍作为兜底候选
+        self.pool.update(self.b,expiring_at=None,remaining=10,credits_updated=0)
+        self.assertEqual(self.pool.select()[0],self.a)
+        self.pool.update(self.a,remaining=0,packages=1,credits_updated=self.now)
+        self.assertEqual(self.pool.select()[0],self.b)
+
+    def test_expiry_first_rebinds_when_binding_is_no_longer_urgent(self):
+        self.store.data['pool']['routing']='expiry_first'
+        key=request_affinity({b'authorization':b'Bearer api-test'},{'model':'m','prompt_cache_key':'expiry-session'})
+        self.pool.update(self.a,expiring_at=self.now+3600)
+        self.pool.update(self.b,expiring_at=self.now+86400)
+        self.assertEqual(self.pool.select(key)[0],self.a)
+        self.assertEqual(self.pool.select(key)[0],self.a)
+        self.pool.update(self.b,expiring_at=self.now+60)
+        self.assertEqual(self.pool.select(key)[0],self.b)
 
     def test_round_robin_paused_cooling_exhausted_and_manual(self):
         self.assertEqual([self.pool.select()[0] for _ in range(4)],[self.a,self.b,self.a,self.b])
