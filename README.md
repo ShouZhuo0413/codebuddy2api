@@ -59,8 +59,8 @@
 你需要先满足这 3 个条件：
 
 1. 本机已经安装并登录 **WorkBuddy / CodeBuddy** 桌面端
-2. 本机有 **Python 3.8+**
-3. 已安装依赖 `fastapi`、`uvicorn`、`httpx`
+2. 本机有 **Python 3.10+**（Docker 使用 Python 3.12）
+3. 已安装依赖 `fastapi`、`uvicorn`、`httpx`、`cryptography`
 
 默认会在这些位置寻找登录态：
 
@@ -77,7 +77,7 @@ git clone https://github.com/ShouZhuo0413/codebuddy2openai.git workbuddy2api
 cd workbuddy2api
 
 uv venv
-uv pip install -r requirements.txt
+uv pip install -r requirements.lock.txt
 ```
 
 也可以用虚拟环境：
@@ -85,7 +85,18 @@ uv pip install -r requirements.txt
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock.txt
+```
+
+`requirements.lock.txt` 锁定直接依赖和间接依赖的版本，推荐用于稳定安装；Docker 构建也使用它。文件保留 Python 版本及平台条件，例如 Windows 不安装 `uvloop`。`requirements.txt` 保留未锁定的直接依赖，主动尝试新版时可运行 `uv pip install --upgrade -r requirements.txt`。
+
+维护者更新锁文件后需重新安装并运行测试：
+
+```bash
+uv pip compile --universal --python-version 3.10 --no-strip-extras --no-annotate --upgrade requirements.txt -o requirements.lock.txt
+uv pip sync requirements.lock.txt
+uv pip install -c requirements.lock.txt pytest
+uv run python -m pytest tests/
 ```
 
 > 注意：无论是启动服务，还是执行 `python3 -m core.converter --help`，都必须先装依赖。
@@ -467,9 +478,11 @@ git clone https://github.com/ShouZhuo0413/codebuddy2openai.git workbuddy2api
 cd workbuddy2api
 
 uv venv
-uv pip install -r requirements.txt
+uv pip install -r requirements.lock.txt
 uv run python -m core.converter --desensitize --log converter.log
 ```
+
+Requires Python 3.10+. `requirements.lock.txt` pins runtime dependencies, including platform-specific conditions, and is also used by Docker builds. Use `requirements.txt` only when intentionally trying newer dependency versions.
 
 Then verify:
 
