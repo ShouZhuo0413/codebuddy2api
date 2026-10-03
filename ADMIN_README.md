@@ -7,8 +7,9 @@
 - 默认概览页：可用账号、已知总积分、完成请求数、完成成功率、HTTP 成功率、失败/进行中、平均耗时及最近 100 条请求。
 - 导入桌面端 `.info` / JSON 凭据，设置备注，启用、停用、删除账号。
 - 浏览器授权登录国内 CodeBuddy / WorkBuddy，无需桌面端。生成官方登录链接，在浏览器完成授权后自动获取并保存账号；同一账号再次登录更新原凭据。
-- 保存多个账号，默认轮流分配新请求；可切换到手动指定模式。暂停、冷却和最近确认积分耗尽的账号不参与轮转。
+- 保存多个账号，默认轮流分配新请求；可切换到积分到期优先或手动指定模式。暂停、冷却和最近确认积分耗尽的账号不参与轮转。
 - 手动刷新凭据、查询当前周期剩余积分；支持单账号与批量签到，每日自动签到可配置时间（北京时间，默认 09:00）。
+- 自动同步桌面端切换工具的账号库（`~/.wb-switch/accounts.json`）：新账号自动并入，已刷新的凭据择优采纳，本地备注、启用状态与积分缓存不被覆盖。
 - 查看访问令牌到期时间。到期状态来自本地凭据，是否能刷新及调用成功以真实模型测试为准。
 - 新建和撤销客户端 API Key。新密钥只显示一次，服务端仅持久化 SHA-256 摘要。
 - 中文接入指南和真实模型调用测试；测试最多等待 90 秒，生成预算上限 1024 tokens，以便推理模型完成思考并输出正文。
@@ -20,10 +21,11 @@
 
 - `admin/server.py`：后台 API、持久化存储、客户端鉴权及转换器适配。
 - `admin/browser_login.py`：WorkBuddy 授权状态创建、独立 cookie 会话、轮询和令牌交换。授权会话绑定管理登录，令牌不返回浏览器；超时、取消、登出后清理。
-- `admin/pool.py`：请求级凭据绑定、轮转、冷却、积分查询与每日签到。`tests/test_account_pool.py` 验证并发隔离、轮转、签到防重复、精确积分及分页。
+- `admin/pool.py`：请求级凭据绑定、轮转、积分到期优先调度、冷却、积分查询与每日签到。`tests/test_account_pool.py` 验证并发隔离、轮转、到期排序、签到防重复、精确积分及分页。
 - `admin/metrics.py`：本次进程启动以来的有界请求统计；不存储请求正文、回复或密钥。
 - `admin/static/`：无外部 CDN 依赖的中文界面。
 - `tests/test_admin_server.py`：鉴权、CSRF、账号生命周期、密钥撤销、重启持久化、上传限制和限流测试。
+- `tests/test_switch_sync.py`：账号库同步的导入、择优采纳、防回退与异常容错测试。
 - `deploy/admin/Dockerfile`：在已部署的转换器镜像上构建管理层，不修改模型转换逻辑。
 
 ## 配置与运行
@@ -36,6 +38,10 @@
 | `CODEBUDDY2OPENAI_KEY` | 首次迁入的客户端 Key；初始化后从持久化状态读取密钥列表 |
 | `CODEBUDDY_AUTH_DIR` | 登录凭据目录，线上 `/data/auth` |
 | `MANAGEMENT_DATA_DIR` | 账号索引与密钥摘要目录，线上 `/data/management` |
+| `ADMIN_HOST` / `ADMIN_PORT` | 管理服务绑定地址与端口，默认 `0.0.0.0:8787` |
+| `ADMIN_COOKIE_SECURE` | 置 `0` 时不加 Secure 标志，供回环 HTTP 环境登录调试 |
+| `SWITCH_SYNC_INTERVAL` | 账号库自动同步间隔（秒），默认 120，置 0 关闭 |
+| `WB_SWITCH_ACCOUNTS_FILE` | 覆盖账号库路径，默认 `~/.wb-switch/accounts.json` |
 
 生产使用一个 Uvicorn 进程。会话和账号选择缓存在进程内，不适用于直接增加多 worker。Nginx 终止 HTTPS，后端端口仅绑定服务器回环地址。管理会话重启后需重新登录。
 
@@ -56,7 +62,7 @@ docker compose -f deploy/admin/docker-compose.yml up -d --build
 
 ## 模型目录更新
 
-在原列表上补充 `hy3`、`hy4-preview`、`kimi-k3`、`glm-5.3`、`glm-5.3-flash`、`deepseek-v4.1-flash` 和 `kimi-k2.8-preview`。API 与管理后台共用 `core/converter.py` 中的模型列表。
+在原列表上补充 `hy3`、`hy4-preview`、`kimi-k3`、`glm-5.3`、`glm-5.3-flash`、`deepseek-v4.1-flash` 和 `kimi-k2.8-preview`。API 与管理后台共用 `core/converter.py` 中的模型列表，该列表现在合并客户端 `product.json` 动态目录与服务端兜底列表并去重：`product.json` 存在时不再整体覆盖兜底列表，服务端已支持但客户端尚未声明的模型不会被丢弃。
 
 这些名称不保证每个账号都有调用权限。2026-09-12 的验证中，`kimi-k2.8-preview` 在上游目录可见，但两个账号调用均返回 11102（模型服务不存在）；此项只加入列表，尚未验证调用成功。其余新增模型曾完成最小调用验证，可用性随上游变化。
 
@@ -66,11 +72,12 @@ docker compose -f deploy/admin/docker-compose.yml up -d --build
 python -m unittest tests.test_admin_server -v
 python -m unittest tests.test_browser_login -v
 python -m unittest tests.test_account_pool -v
+python -m unittest tests.test_switch_sync -v
 python -m unittest tests.test_request_metrics -v
 node --check admin/static/app.js
 ```
 
-5 组后台测试在本机和生产镜像内均通过。浏览器验证本地登录、账号列表和 JSON 导入；公网验证登录页、管理会话、现有客户端 Key、新 Key 创建与撤销。后台通过 deepseek-v4-flash 发起真实调用，返回 HTTP 200 / OK。
+上述后台测试在本机和生产镜像内均通过。浏览器验证本地登录、账号列表和 JSON 导入；公网验证登录页、管理会话、现有客户端 Key、新 Key 创建与撤销。后台通过 deepseek-v4-flash 发起真实调用，返回 HTTP 200 / OK。
 
 ## 数据与恢复
 
@@ -91,6 +98,10 @@ node --check admin/static/app.js
 ## 账号池
 
 首次升级后默认启用轮转和北京时间 09:00 自动签到，可在页面底部修改。服务端每 5 分钟查询启用账号的积分及签到状态，页面每 30 秒刷新缓存视图；“刷新状态”主动查询上游。暂停账号不参与后台批量任务。
+
+请求分配支持轮转、积分到期优先与手动指定三种方式。积分到期优先先收窄到可用积分最快到期的账号，再在该批内轮转；到期时间取自上游套餐字段，周期额度按周期结束时间、一次性额度按扣减截止时间计算，7 天内到期会在账号列表高亮。会话键在 24 小时内固定绑定同一账号，仅当所绑账号离开到期紧迫批次时才重新绑定，以保留上游提示缓存亲和。
+
+账号库（`~/.wb-switch/accounts.json`）默认每 120 秒自动同步一次，也可在页面点击“立即同步账号库”或调用 `POST /admin/api/pool/actions/sync` 手动触发。新账号自动并入账号池；已刷新的凭据按 `expiresAt` 与 `lastRefreshTime` 比较，仅在账号库确实更新时采纳，避免把池内刚刷新的令牌回退为旧值。同步不改写本地备注、启用状态、当前选择账号与积分缓存，也不写入账号库文件本身。账号库缺失或不可读不影响服务运行。
 
 积分优先使用上游 Precise 小数字段和当前周期剩余额度，分页汇总所有未过期积分包。查询失败保留历史数值，10 分钟以上的快照标为待刷新；无数据不等于零积分。额度耗尽只影响分配，不删除账号。自动签到按上游当日状态避免重复，错过时间可补查，失败最多每 30 分钟再次尝试，成功日期持久化。
 

@@ -269,6 +269,7 @@ NON_CHAT_MODEL_TAGS = {
     "text-to-image",
     "image-to-image",
     "text-to-video",
+    "image-to-video",
 }
 
 
@@ -390,19 +391,27 @@ def get_available_models() -> list[str]:
     """
     获取可用的模型列表。
 
-    优先从 WorkBuddy product.json 读取，如果失败则使用 DEFAULT_MODELS。
+    合并两个来源（而非二选一）：
+    1. WorkBuddy product.json 的动态列表（跟随客户端更新，优先）
+    2. DEFAULT_MODELS 兜底列表（服务端已支持但客户端尚未声明的模型）
+
+    这样目录既能跟随客户端版本更新，又不会因为 product.json 存在
+    而把 DEFAULT_MODELS 里的模型（如 glm-5.3-flash、kimi-k3 等）
+    整体短路丢弃。
 
     Returns:
-        模型 ID 列表
+        去重后的模型 ID 列表
     """
     workbuddy_models = _load_models_from_workbuddy()
 
-    if workbuddy_models:
-        # 成功从 WorkBuddy 加载，使用动态列表
-        return workbuddy_models
-    else:
-        # 降级到硬编码列表
-        return DEFAULT_MODELS
+    merged = list(workbuddy_models)
+    seen = set(merged)
+    for model_id in DEFAULT_MODELS:
+        if model_id not in seen:
+            merged.append(model_id)
+            seen.add(model_id)
+
+    return merged
 
 
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
